@@ -1,8 +1,12 @@
-// FrameLock hook DLL - controlled game clock + lossless frame-by-frame capture.
-// Injected into the game. Virtualizes the common Windows time sources and steps
-// them by exactly 1/FPS per presented frame while recording. Each frame is read
-// back from the back buffer and written as a max-quality JPEG BEFORE the game is
-// allowed to advance, so frames are never skipped or duplicated.
+// FrameLock hook DLL (v2) - frame-by-frame image sequence exporter.
+// Two explicitly separate modes:
+//  * LOCKED (offline export): the game clock is stepped by exactly 1/FPS per captured frame.
+//    Time is NOT frozen: inside a step it advances normally (bounded below the next step
+//    boundary), so frame limiters / waits complete and the game can always reach Present.
+//  * REALTIME: clock untouched, every frame the game actually presents is saved (no fabrication).
+// Capture: backbuffer copy is recorded right before the original Present (completed frame),
+// read back asynchronously (D3D11 staging ring / D3D12 readback ring + fence) and encoded on a
+// worker thread. Bounded queues give backpressure instead of dropping frames.
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -11,7 +15,6 @@
 #include <objbase.h>
 #include <shlobj.h>
 #include <d3d9.h>
-#include <d3d10_1.h>
 #include <d3d11.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -19,12 +22,13 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <deque>
 #include <vector>
 #include <string>
+#include <algorithm>
 #include <cstdio>
-#include <cstdint>
 #include <cstring>
-#include <oleauto.h>
+#include <cstdint>
 #include <cstdarg>
 #include <cmath>
 #include "MinHook.h"
@@ -37,18 +41,18 @@ static std::mutex g_logMx;
 
 // ============================================================ logging / status
 static void Log(const wchar_t* fmt, ...) {
-    wchar_t buf[1024];
+    wchar_t buf[2048];
     va_list a; va_start(a, fmt); _vsnwprintf_s(buf, _TRUNCATE, fmt, a); va_end(a);
     std::lock_guard<std::mutex> l(g_logMx);
     FILE* f = nullptr;
     if (_wfopen_s(&f, g_logPath, L"a, ccs=UTF-8") == 0 && f) {
         SYSTEMTIME st; GetLocalTime(&st);
-        fwprintf(f, L"[%02d:%02d:%02d.%03d] %s\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
+        fwprintf(f, L"[%02d:%02d:%02d.%03d][T%05lu] %s\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, GetCurrentThreadId(), buf);
         fclose(f);
     }
 }
 static void SetStatus(const wchar_t* s) { if (g_sh) wcsncpy_s(g_sh->status, s, _TRUNCATE); Log(L"%s", s); }
-static void SetApi(const wchar_t* s) { if (g_sh && wcscmp(g_sh->api, s) != 0) wcsncpy_s(g_sh->api, s, _TRUNCATE); }
+static void SetApi(const wchar_t* s) { if (g_sh && wcscmp(g_sh->api, s) != 0) { wcsncpy_s(g_sh->api, s, _TRUNCATE); Log(L"API: %s", s); } }
 
 // ============================================================ hook helpers
 static void* Proc(const wchar_t* mod, const char* fn) {
@@ -77,15 +81,9 @@ static int64_t  g_qpc0 = 0;     // real QPC at init
 static uint64_t g_tick0 = 0;    // GetTickCount64 at init
 static uint32_t g_tgt0 = 0;     // timeGetTime at init
 static int64_t  g_ft0 = 0;      // system FILETIME at init
-
-static std::atomic<bool>    g_rec{ false };      // recording -> clock is frozen/stepped
-static std::atomic<int64_t> g_offset{ 0 };       // virtual - real while not recording
-static int64_t              g_recBase = 0;       // virtual QPC at frame 0
-static std::atomic<int64_t> g_frame{ 0 };        // current frame index
-static int64_t              g_fpsNum = 24, g_fpsDen = 1;
+static int64_t  g_fpsNum = 24, g_fpsDen = 1;
 
 static int64_t MulDiv64(int64_t a, int64_t b, int64_t c) { return (a / c) * b + ((a % c) * b) / c; }
-
 static int64_t RealQPC() {
     LARGE_INTEGER li;
     if (o_RtlQPC) o_RtlQPC(&li);
@@ -94,28 +92,91 @@ static int64_t RealQPC() {
     else QueryPerformanceCounter(&li);
     return li.QuadPart;
 }
-// exact integer tick position of frame n: floor(n * freq * den / num).
-// Split quotient/remainder terms to avoid overflowing n * freq * den.
-static int64_t FrameTicks(int64_t n) {
-    const int64_t numerator = g_freq * g_fpsDen;
-    const int64_t denominator = g_fpsNum;
-    const int64_t whole = numerator / denominator;
-    const int64_t rem = numerator % denominator;
-    return n * whole + (n / denominator) * rem + ((n % denominator) * rem) / denominator;
-}
+static double RealMs(int64_t ticks) { return ticks * 1000.0 / (double)g_freq; }
+// exact tick position of step n: n * freq * den / num (integer math, no drift)
+static int64_t FrameTicks(int64_t n) { return MulDiv64(n, g_freq * g_fpsDen, g_fpsNum); }
 
+// Locked-clock state for the current step n. Virtual time seen by the game during step n:
+//   base                      during a bounded initial dead zone (at most 10 ms)
+//   base + (e - dead)         afterwards, advancing at real speed ...
+//   base + step - 1           ... capped just below the next step boundary (monotonic, no overlap)
+// If the game busy-waits on a hooked clock while it is held at the cap, the clock is released
+// after >0.5 s and >1000 clock queries. This releases that clock-busy-wait, and records a slip.
+struct ClockState { int64_t base, step, anchor, dead; };
+static SRWLOCK              g_clk = SRWLOCK_INIT;
+static ClockState           g_cs = {};
+static std::atomic<bool>    g_lock{ false };        // locked clock active
+static std::atomic<int64_t> g_offset{ 0 };          // virtual - real while not locked
+static int64_t              g_recBase = 0, g_slip = 0;
+static std::atomic<int64_t> g_stepIdx{ 0 };
+static std::atomic<bool>    g_freeRun{ false };
+static std::atomic<int64_t> g_holdQ{ 0 };
+
+static int64_t DeadZone(int64_t step) { return std::min(step / 4, g_freq / 100); }   // <= 10 ms
+static int64_t ClockEval(const ClockState& c, int64_t real, bool countQuery) {
+    int64_t e = real - c.anchor; if (e < 0) e = 0;
+    if (e <= c.dead) return c.base;
+    int64_t cap = c.step - 1, add = e - c.dead;
+    if (add < cap) return c.base + add;
+    int64_t held = add - cap;
+    if (g_freeRun.load(std::memory_order_relaxed)) return c.base + cap + held;
+    if (countQuery) {
+        int64_t q = ++g_holdQ;
+        if (held > g_freq / 2 && q > 1000) {
+            bool exp = false;
+            if (g_freeRun.compare_exchange_strong(exp, true)) {
+                if (g_sh) InterlockedIncrement64(&g_sh->slipEvents);
+                Log(L"CLOCK: game busy-waits on the clock past one output step (FPS cap/limiter lower than output FPS?). "
+                    L"Clock released to avoid a hang; step %lld will be longer than 1/FPS (slip).", (long long)g_stepIdx.load());
+            }
+            return c.base + cap + held;
+        }
+    }
+    return c.base + cap;
+}
 static int64_t VirtQPC() {
-    if (!g_rec.load(std::memory_order_acquire))
-        return RealQPC() + g_offset.load(std::memory_order_relaxed);
-    // Strict mode: time is frozen at one frame boundary. It advances only after
-    // that frame has been captured and its JPEG has been committed to disk.
-    // There is deliberately no watchdog time nudge: any such nudge would violate
-    // exact 1/FPS stepping. Games that busy-wait for time to pass may stall here.
-    return g_recBase + FrameTicks(g_frame.load(std::memory_order_acquire));
+    if (!g_lock.load(std::memory_order_acquire)) return RealQPC() + g_offset.load(std::memory_order_relaxed);
+    AcquireSRWLockShared(&g_clk); ClockState c = g_cs; ReleaseSRWLockShared(&g_clk);
+    return ClockEval(c, RealQPC(), true);
 }
 static int64_t VirtDelta(int64_t unitsPerSec) {
     int64_t d = VirtQPC() - g_qpc0;
     return d >= 0 ? MulDiv64(d, unitsPerSec, g_freq) : -MulDiv64(-d, unitsPerSec, g_freq);
+}
+// Step 0 begins when the Present that started the take returns.
+static void ClockStart() {
+    AcquireSRWLockExclusive(&g_clk);
+    int64_t real = RealQPC();
+    g_recBase = real + g_offset.load(); g_slip = 0; g_stepIdx = 0;
+    g_cs.base = g_recBase; g_cs.step = FrameTicks(1); g_cs.anchor = real; g_cs.dead = DeadZone(g_cs.step);
+    g_freeRun = false; g_holdQ = 0;
+    g_lock.store(true, std::memory_order_release);
+    ReleaseSRWLockExclusive(&g_clk);
+    Log(L"CLOCK: locked at step 0 (step = %lld ticks, freq %lld, dead zone %.2f ms)", (long long)g_cs.step, (long long)g_freq, RealMs(g_cs.dead));
+}
+// Called after the Present whose frame was safely queued: move to the next exact step.
+static void ClockAdvance() {
+    AcquireSRWLockExclusive(&g_clk);
+    int64_t real = RealQPC();
+    int64_t vnow = ClockEval(g_cs, real, false);
+    int64_t n = g_stepIdx + 1;
+    int64_t nb = g_recBase + FrameTicks(n) + g_slip;
+    int64_t extra = 0;
+    if (vnow >= nb) { extra = vnow - nb + 1; g_slip += extra; nb += extra; }   // keep time monotonic after a free-run
+    g_cs.base = nb; g_cs.step = FrameTicks(n + 1) - FrameTicks(n); g_cs.anchor = real; g_cs.dead = DeadZone(g_cs.step);
+    g_stepIdx = n; g_freeRun = false; g_holdQ = 0;
+    ReleaseSRWLockExclusive(&g_clk);
+    if (extra) Log(L"CLOCK: slip at step %lld: +%.3f ms (this step was not exactly 1/FPS)", (long long)(n - 1), RealMs(extra));
+}
+static void ClockStop() {
+    if (!g_lock.load()) return;
+    AcquireSRWLockExclusive(&g_clk);
+    int64_t real = RealQPC();
+    int64_t v = ClockEval(g_cs, real, false);
+    g_offset.store(v - real);           // continuous, monotonic after unlocking
+    g_lock.store(false, std::memory_order_release);
+    ReleaseSRWLockExclusive(&g_clk);
+    Log(L"CLOCK: unlocked after %lld steps (total slip %.3f ms)", (long long)g_stepIdx.load(), RealMs(g_slip));
 }
 
 // ---- time detours (none of them call the original except for real QPC reads)
@@ -157,67 +218,12 @@ static void InstallTimeHooks() {
     Hook(Proc(L"winmmbase.dll", "timeGetTime"), (void*)Hk_timeGetTime, nullptr, "winmmbase!timeGetTime");
 }
 
-// ============================================================ JPEG writer (WIC, quality 1.0, 4:4:4)
-struct SaveJob { const wchar_t* path; int w; int h; const uint8_t* data; bool done; bool ok; };
-static std::mutex g_wMx;
-static std::condition_variable g_wCv;
-static SaveJob* g_job = nullptr;
-
-static bool EncodeJpeg(IWICImagingFactory* fac, const SaveJob& j) {
-    IWICStream* st = nullptr; IWICBitmapEncoder* enc = nullptr; IWICBitmapFrameEncode* fr = nullptr; IPropertyBag2* bag = nullptr;
-    bool ok = false;
-    do {
-        if (FAILED(fac->CreateStream(&st))) break;
-        if (FAILED(st->InitializeFromFilename(j.path, GENERIC_WRITE))) break;
-        if (FAILED(fac->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &enc))) break;
-        if (FAILED(enc->Initialize(st, WICBitmapEncoderNoCache))) break;
-        if (FAILED(enc->CreateNewFrame(&fr, &bag))) break;
-        PROPBAG2 opt = {}; VARIANT v; VariantInit(&v);
-        opt.pstrName = (LPOLESTR)L"ImageQuality"; v.vt = VT_R4; v.fltVal = 1.0f; bag->Write(1, &opt, &v);
-        opt.pstrName = (LPOLESTR)L"JpegYCrCbSubsampling"; v.vt = VT_UI1; v.bVal = (BYTE)WICJpegYCrCbSubsampling444; bag->Write(1, &opt, &v);
-        if (FAILED(fr->Initialize(bag))) break;
-        if (FAILED(fr->SetSize((UINT)j.w, (UINT)j.h))) break;
-        WICPixelFormatGUID pf = GUID_WICPixelFormat24bppBGR;
-        if (FAILED(fr->SetPixelFormat(&pf))) break;
-        UINT stride = (UINT)j.w * 3;
-        if (FAILED(fr->WritePixels((UINT)j.h, stride, stride * (UINT)j.h, (BYTE*)j.data))) break;
-        if (FAILED(fr->Commit())) break;
-        if (FAILED(enc->Commit())) break;
-        ok = true;
-    } while (0);
-    if (bag) bag->Release(); if (fr) fr->Release(); if (enc) enc->Release(); if (st) st->Release();
-    return ok;
-}
-static DWORD WINAPI WriterThread(LPVOID) {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    IWICImagingFactory* fac = nullptr;
-    CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac));
-    if (!fac) Log(L"WIC factory creation failed");
-    for (;;) {
-        SaveJob* j;
-        { std::unique_lock<std::mutex> l(g_wMx); g_wCv.wait(l, [] { return g_job && !g_job->done; }); j = g_job; }
-        bool ok = fac && EncodeJpeg(fac, *j);
-        { std::lock_guard<std::mutex> l(g_wMx); j->ok = ok; j->done = true; g_job = nullptr; }
-        g_wCv.notify_all();
-    }
-}
-// Blocks the calling (render) thread until the JPEG is fully written to disk.
-static bool SaveJpegSync(const wchar_t* path, int w, int h, const uint8_t* data) {
-    SaveJob j = { path, w, h, data, false, false };
-    std::unique_lock<std::mutex> l(g_wMx);
-    g_wCv.wait(l, [] { return g_job == nullptr; });
-    g_job = &j;
-    g_wCv.notify_all();
-    g_wCv.wait(l, [&] { return j.done; });
-    return j.ok;
-}
-
 // ============================================================ pixel conversion -> BGR24
 struct Frame {
     int w = 0, h = 0; std::vector<uint8_t> bgr;
     void alloc(int W, int H) { w = W; h = H; bgr.resize((size_t)W * H * 3); }
 };
-enum class PF { BGRA8, RGBA8, RGB10A2, RGBA16F, D9_A2R10G10B10, BGR565 };
+enum class PF { BGRA8, RGBA8, RGB10A2, RGBA16F, D9_A2R10G10B10, BGR565, BGR24 };
 
 static uint8_t g_srgbLut[4097];
 static void InitLut() {
@@ -239,6 +245,7 @@ static void Convert(PF pf, const uint8_t* src, size_t pitch, int w, int h, uint8
     for (int y = 0; y < h; y++) {
         const uint8_t* s = src + (size_t)(flipY ? (h - 1 - y) : y) * pitch;
         uint8_t* d = dst + (size_t)y * w * 3;
+        if (pf == PF::BGR24) { memcpy(d, s, (size_t)w * 3); continue; }
         for (int x = 0; x < w; x++, d += 3) {
             switch (pf) {
             case PF::BGRA8: d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; s += 4; break;
@@ -272,169 +279,462 @@ static DXGI_FORMAT Typed(DXGI_FORMAT f) {
     }
 }
 
-// Flip-model swap chains rotate their render target. GetBuffer(0) is not
-// necessarily the buffer currently being rendered, so query the current index
-// when IDXGISwapChain3 is available (legacy discard swap chains fall back to 0).
-static UINT CurrentDXGIBackBufferIndex(IDXGISwapChain* sc) {
-    IDXGISwapChain3* sc3 = nullptr;
-    if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3) {
-        UINT index = sc3->GetCurrentBackBufferIndex();
-        sc3->Release();
-        return index;
+// ============================================================ take state + failure reporting
+enum class Api { None, D11, D12, D9, GL };
+static std::mutex        g_stepMx;
+static std::atomic<bool> g_rec{ false };          // a take is active
+static bool              g_lockMode = true;        // take mode (locked vs realtime)
+static void*             g_target = nullptr;       // swapchain/device/window being recorded
+static Api               g_api = Api::None;
+static int               g_fails = 0;
+static int64_t           g_nextIdx = 0;            // next frame index to capture (== frames queued)
+static int64_t           g_testTarget = 0;
+static int64_t           g_takeStartReal = 0;
+static std::atomic<int>  g_takeId{ 0 };
+static std::atomic<int>  g_failedTake{ -1 };       // take that hit an async (post-queue) failure
+static std::atomic<bool> g_asyncFail{ false };
+static std::wstring      g_takeDir;
+static thread_local bool t_inPresent = false;
+
+static void ReportAsyncFailure(int takeId, int64_t idx, const wchar_t* stage, HRESULT hr) {
+    g_failedTake = takeId;
+    if (g_sh) InterlockedExchange(&g_sh->lastHr, (LONG)hr);
+    wchar_t m[512];
+    swprintf_s(m, L"ERROR: frame_%06lld failed at stage '%s' (HRESULT 0x%08X). Recording stopped; frames 0..%lld are complete and contiguous.",
+        (long long)idx, stage, (unsigned)hr, (long long)idx - 1);
+    SetStatus(m);
+    g_asyncFail = true;
+}
+static size_t BppOf(PF pf) { return pf == PF::RGBA16F ? 8 : pf == PF::BGR565 ? 2 : pf == PF::BGR24 ? 3 : 4; }
+
+// ============================================================ async readback / encode queue
+struct D12Slot { ID3D12Resource* rb = nullptr; ID3D12CommandAllocator* al = nullptr; ID3D12GraphicsCommandList* cl = nullptr; UINT64 size = 0; bool busy = false; };
+struct Job {
+    int takeId = 0; int64_t idx = -1; std::wstring dir;
+    int w = 0, h = 0; PF pf = PF::BGR24; size_t pitch = 0; std::vector<uint8_t> raw;     // CPU pixels
+    D12Slot* slot = nullptr; ID3D12Fence* fence = nullptr; ID3D12Device* dev = nullptr;  // D3D12 readback
+    UINT64 fenceVal = 0, offset = 0, size = 0;
+    bool end = false; int64_t endCount = 0; int64_t testTarget = 0; bool realtime = false; double wallSec = 0;
+};
+static const size_t kMaxJobs = 4;     // bounded queue: producer waits (backpressure), never drops
+static std::mutex g_jMx; static std::condition_variable g_jCv; static std::deque<Job> g_jobs;
+static std::mutex g_slotMx; static std::condition_variable g_slotCv;
+
+static void Enqueue(Job&& j) {
+    std::unique_lock<std::mutex> l(g_jMx);
+    if (!j.end && g_jobs.size() >= kMaxJobs) {
+        int64_t t0 = RealQPC();
+        g_jCv.wait(l, [] { return g_jobs.size() < kMaxJobs; });
+        Log(L"Backpressure: render thread waited %.1f ms for the encoder (frame %lld)", RealMs(RealQPC() - t0), (long long)j.idx);
     }
-    return 0;
+    g_jobs.push_back(std::move(j));
+    l.unlock(); g_jCv.notify_all();
+}
+static void ReleaseSlot(D12Slot* s) { { std::lock_guard<std::mutex> l(g_slotMx); s->busy = false; } g_slotCv.notify_all(); }
+
+// A slot may only be reused after its GPU copy fence is confirmed complete. This is
+// also used when a take has already failed and queued frames are being discarded.
+static bool WaitD12JobFence(const Job& j, HANDLE ev, HRESULT& e, const wchar_t*& stage) {
+    stage = L"D3D12 copy fence wait";
+    if (!j.fence) { e = E_POINTER; stage = L"D3D12 missing copy fence"; return false; }
+    UINT64 completed = j.fence->GetCompletedValue();
+    if (completed == UINT64_MAX) {
+        e = j.dev ? j.dev->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
+        if (SUCCEEDED(e)) e = DXGI_ERROR_DEVICE_REMOVED;
+        stage = L"D3D12 fence reports device removed";
+        return false;
+    }
+    if (completed < j.fenceVal) {
+        if (!ev) { e = E_HANDLE; stage = L"D3D12 fence event creation"; return false; }
+        e = j.fence->SetEventOnCompletion(j.fenceVal, ev);
+        if (FAILED(e)) { stage = L"D3D12 SetEventOnCompletion"; return false; }
+        DWORD wr = WaitForSingleObject(ev, 10000);
+        if (wr != WAIT_OBJECT_0) {
+            HRESULT removed = j.dev ? j.dev->GetDeviceRemovedReason() : S_OK;
+            if (FAILED(removed)) e = removed;
+            else if (wr == WAIT_TIMEOUT) e = HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+            else { DWORD le = GetLastError(); e = HRESULT_FROM_WIN32(le ? le : ERROR_GEN_FAILURE); }
+            Log(L"[D3D12] fence wait failed (wait=%lu): completed=%llu wanted=%llu hr=0x%08X",
+                (unsigned long)wr, j.fence->GetCompletedValue(), j.fenceVal, (unsigned)e);
+            stage = L"D3D12 fence wait failed";
+            return false;
+        }
+        completed = j.fence->GetCompletedValue();
+        if (completed == UINT64_MAX || completed < j.fenceVal) {
+            e = j.dev ? j.dev->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
+            if (SUCCEEDED(e)) e = DXGI_ERROR_DEVICE_REMOVED;
+            stage = L"D3D12 fence did not confirm completion";
+            return false;
+        }
+    }
+    e = S_OK;
+    return true;
 }
 
-// ============================================================ Direct3D 10 capture (DXGI swap chain)
-static bool CaptureD3D10(IDXGISwapChain* sc, ID3D10Device* dev, Frame& fr) {
-    ID3D10Texture2D* bb = nullptr;
-    if (FAILED(sc->GetBuffer(CurrentDXGIBackBufferIndex(sc), __uuidof(ID3D10Texture2D), (void**)&bb)) || !bb) return false;
-    D3D10_TEXTURE2D_DESC d; bb->GetDesc(&d);
-    PF pf;
-    if (!PFFromDXGI(d.Format, pf)) { bb->Release(); SetStatus(L"Unsupported back buffer format (D3D10)"); return false; }
-    ID3D10Texture2D* src = bb;
-    ID3D10Texture2D* resolved = nullptr;
-    ID3D10Texture2D* staging = nullptr;
+// If a fence cannot be confirmed, intentionally abandon the COM references. Releasing
+// or reusing these resources could race a GPU command that is still in flight.
+static void RetireD12Slot(D12Slot* s) {
+    std::lock_guard<std::mutex> l(g_slotMx);
+    s->rb = nullptr; s->al = nullptr; s->cl = nullptr; s->size = 0;
+}
+
+static bool EncodeJpeg(IWICImagingFactory* fac, const wchar_t* path, int w, int h, const uint8_t* data, bool v, HRESULT& hr, const wchar_t*& stage) {
+    std::wstring tmp = std::wstring(path) + L".tmp";
+    IWICStream* st = nullptr; IWICBitmapEncoder* enc = nullptr; IWICBitmapFrameEncode* fr = nullptr; IPropertyBag2* bag = nullptr;
     bool ok = false;
     do {
-        if (d.SampleDesc.Count > 1) {
-            D3D10_TEXTURE2D_DESC rd = d;
-            rd.SampleDesc.Count = 1; rd.SampleDesc.Quality = 0;
-            rd.Format = Typed(d.Format); rd.Usage = D3D10_USAGE_DEFAULT;
-            rd.BindFlags = 0; rd.CPUAccessFlags = 0; rd.MiscFlags = 0;
-            rd.MipLevels = 1; rd.ArraySize = 1;
-            if (FAILED(dev->CreateTexture2D(&rd, nullptr, &resolved))) break;
-            dev->ResolveSubresource(resolved, 0, bb, 0, rd.Format);
-            src = resolved;
-        }
-        D3D10_TEXTURE2D_DESC sd = d;
-        sd.SampleDesc.Count = 1; sd.SampleDesc.Quality = 0;
-        sd.Usage = D3D10_USAGE_STAGING; sd.BindFlags = 0;
-        sd.CPUAccessFlags = D3D10_CPU_ACCESS_READ; sd.MiscFlags = 0;
-        sd.MipLevels = 1; sd.ArraySize = 1;
-        if (resolved) sd.Format = Typed(d.Format);
-        if (FAILED(dev->CreateTexture2D(&sd, nullptr, &staging))) break;
-        dev->CopyResource(staging, src);
-        D3D10_MAPPED_TEXTURE2D mapped = {};
-        if (FAILED(staging->Map(0, D3D10_MAP_READ, 0, &mapped))) break;
-        fr.alloc((int)d.Width, (int)d.Height);
-        Convert(pf, (const uint8_t*)mapped.pData, mapped.RowPitch, fr.w, fr.h, fr.bgr.data());
-        staging->Unmap(0);
+        stage = L"JPEG CreateStream";      hr = fac->CreateStream(&st); if (FAILED(hr)) break;
+        stage = L"JPEG create file";       hr = st->InitializeFromFilename(tmp.c_str(), GENERIC_WRITE); if (FAILED(hr)) break;
+        stage = L"JPEG CreateEncoder";     hr = fac->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &enc); if (FAILED(hr)) break;
+        stage = L"JPEG encoder Initialize"; hr = enc->Initialize(st, WICBitmapEncoderNoCache); if (FAILED(hr)) break;
+        stage = L"JPEG CreateNewFrame";    hr = enc->CreateNewFrame(&fr, &bag); if (FAILED(hr)) break;
+        PROPBAG2 opt = {}; VARIANT var; VariantInit(&var);
+        opt.pstrName = (LPOLESTR)L"ImageQuality"; var.vt = VT_R4; var.fltVal = 1.0f; HRESULT h1 = bag->Write(1, &opt, &var);
+        opt.pstrName = (LPOLESTR)L"JpegYCrCbSubsampling"; var.vt = VT_UI1; var.bVal = (BYTE)WICJpegYCrCbSubsampling444; HRESULT h2 = bag->Write(1, &opt, &var);
+        if (v || FAILED(h1) || FAILED(h2)) Log(L"JPEG options: quality hr=0x%08X, 4:4:4 hr=0x%08X (non-fatal)", (unsigned)h1, (unsigned)h2);
+        stage = L"JPEG frame Initialize";  hr = fr->Initialize(bag); if (FAILED(hr)) break;
+        stage = L"JPEG SetSize";           hr = fr->SetSize((UINT)w, (UINT)h); if (FAILED(hr)) break;
+        stage = L"JPEG SetPixelFormat";
+        WICPixelFormatGUID pf = GUID_WICPixelFormat24bppBGR; hr = fr->SetPixelFormat(&pf); if (FAILED(hr)) break;
+        if (pf != GUID_WICPixelFormat24bppBGR) { hr = WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT; break; }
+        UINT stride = (UINT)w * 3;
+        stage = L"JPEG WritePixels";       hr = fr->WritePixels((UINT)h, stride, stride * (UINT)h, (BYTE*)data); if (FAILED(hr)) break;
+        stage = L"JPEG frame Commit";      hr = fr->Commit(); if (FAILED(hr)) break;
+        stage = L"JPEG encoder Commit";    hr = enc->Commit(); if (FAILED(hr)) break;
         ok = true;
     } while (0);
-    if (staging) staging->Release();
-    if (resolved) resolved->Release();
-    bb->Release();
+    if (bag) bag->Release(); if (fr) fr->Release(); if (enc) enc->Release(); if (st) st->Release();   // closes the file
+    if (ok) {
+        stage = L"rename .tmp -> .jpg";
+        if (!MoveFileExW(tmp.c_str(), path, MOVEFILE_REPLACE_EXISTING)) { hr = HRESULT_FROM_WIN32(GetLastError()); ok = false; }
+    }
+    if (!ok) DeleteFileW(tmp.c_str());
     return ok;
 }
 
-// ============================================================ Direct3D 11 capture
-static bool CaptureD3D11(IDXGISwapChain* sc, ID3D11Device* dev, Frame& fr) {
-    ID3D11Texture2D* bb = nullptr;
-    if (FAILED(sc->GetBuffer(CurrentDXGIBackBufferIndex(sc), __uuidof(ID3D11Texture2D), (void**)&bb)) || !bb) return false;
-    D3D11_TEXTURE2D_DESC d; bb->GetDesc(&d);
-    PF pf; if (!PFFromDXGI(d.Format, pf)) { bb->Release(); SetStatus(L"Unsupported back buffer format (D3D11)"); return false; }
-    ID3D11DeviceContext* ctx = nullptr; dev->GetImmediateContext(&ctx);
-    if (!ctx) { bb->Release(); return false; }
-    ID3D11Texture2D* src = bb; ID3D11Texture2D* resolved = nullptr; ID3D11Texture2D* st = nullptr;
-    bool ok = false;
-    do {
-        if (d.SampleDesc.Count > 1) {
-            D3D11_TEXTURE2D_DESC rd = d; rd.SampleDesc.Count = 1; rd.SampleDesc.Quality = 0; rd.Format = Typed(d.Format);
-            rd.Usage = D3D11_USAGE_DEFAULT; rd.BindFlags = 0; rd.CPUAccessFlags = 0; rd.MiscFlags = 0; rd.MipLevels = 1; rd.ArraySize = 1;
-            if (FAILED(dev->CreateTexture2D(&rd, nullptr, &resolved))) break;
-            ctx->ResolveSubresource(resolved, 0, bb, 0, rd.Format);
-            src = resolved;
+static uint64_t Fnv1a(const uint8_t* p, size_t n) { uint64_t x = 1469598103934665603ull; for (size_t i = 0; i < n; i++) { x ^= p[i]; x *= 1099511628211ull; } return x; }
+
+// Self-test verification: file count, sequential names, sizes, decodability, repeated hashes.
+static void VerifyTake(IWICImagingFactory* fac, const std::wstring& dir, int64_t expect) {
+    int64_t missing = 0, empty = 0, undecodable = 0, adjRepeat = 0, files = 0, tmpLeft = 0;
+    uint64_t prev = 0; std::vector<uint8_t> buf;
+    for (int64_t i = 0; i < expect; i++) {
+        wchar_t p[MAX_PATH + 32]; swprintf_s(p, L"%s\\frame_%06lld.jpg", dir.c_str(), (long long)i);
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (!GetFileAttributesExW(p, GetFileExInfoStandard, &fa)) { missing++; Log(L"TEST: missing %s", p); continue; }
+        if (fa.nFileSizeLow == 0 && fa.nFileSizeHigh == 0) { empty++; Log(L"TEST: zero-size %s", p); continue; }
+        IWICBitmapDecoder* dec = nullptr; IWICBitmapFrameDecode* fd = nullptr; IWICFormatConverter* cv = nullptr;
+        HRESULT hr = fac ? fac->CreateDecoderFromFilename(p, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec) : E_POINTER;
+        UINT w = 0, h = 0;
+        if (SUCCEEDED(hr)) hr = dec->GetFrame(0, &fd);
+        if (SUCCEEDED(hr)) hr = fd->GetSize(&w, &h);
+        if (SUCCEEDED(hr)) hr = fac->CreateFormatConverter(&cv);
+        if (SUCCEEDED(hr)) hr = cv->Initialize(fd, GUID_WICPixelFormat24bppBGR, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom);
+        if (SUCCEEDED(hr)) { buf.resize((size_t)w * h * 3); hr = cv->CopyPixels(nullptr, w * 3, (UINT)buf.size(), buf.data()); }
+        if (cv) cv->Release(); if (fd) fd->Release(); if (dec) dec->Release();
+        if (FAILED(hr)) { undecodable++; Log(L"TEST: cannot decode %s hr=0x%08X", p, (unsigned)hr); continue; }
+        uint64_t hs = Fnv1a(buf.data(), buf.size());
+        if (i > 0 && hs == prev) { adjRepeat++; Log(L"TEST: frame_%06lld identical to previous frame", (long long)i); }
+        prev = hs;
+    }
+    WIN32_FIND_DATAW fd; HANDLE fh = FindFirstFileW((dir + L"\\frame_*.jpg").c_str(), &fd);
+    if (fh != INVALID_HANDLE_VALUE) { do files++; while (FindNextFileW(fh, &fd)); FindClose(fh); }
+    fh = FindFirstFileW((dir + L"\\*.tmp").c_str(), &fd);
+    if (fh != INVALID_HANDLE_VALUE) { do tmpLeft++; while (FindNextFileW(fh, &fd)); FindClose(fh); }
+    bool filesOk = missing == 0 && empty == 0 && undecodable == 0 && files == expect && tmpLeft == 0;
+    bool pass = filesOk && adjRepeat == 0;
+    wchar_t m[512];
+    swprintf_s(m, L"TEST %s: %lld/%lld files (frame_000000..frame_%06lld), missing %lld, zero-size %lld, undecodable %lld, leftover .tmp %lld, "
+        L"repeated adjacent hashes %lld%s",
+        pass ? L"PASS" : L"FAIL", (long long)files, (long long)expect, (long long)expect - 1, (long long)missing, (long long)empty,
+        (long long)undecodable, (long long)tmpLeft, (long long)adjRepeat,
+        (filesOk && !pass) ? L" (files OK; repeats mean a static/paused scene or a frame that did not change)" : L"");
+    SetStatus(m);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, (dir + L"\\test_report.txt").c_str(), L"w, ccs=UTF-8") == 0 && f) { fwprintf(f, L"%s\n", m); fclose(f); }
+}
+
+static DWORD WINAPI WorkerThread(LPVOID) {
+    HRESULT hc = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IWICImagingFactory* fac = nullptr;
+    HRESULT hf = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac));
+    Log(L"Encoder thread: CoInitializeEx hr=0x%08X, WIC factory hr=0x%08X", (unsigned)hc, (unsigned)hf);
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!ev) Log(L"Encoder thread: CreateEventW failed (error %lu); D3D12 slots will be retired if a fence wait is needed", GetLastError());
+    std::vector<uint8_t> bgr;
+    for (;;) {
+        Job j;
+        { std::unique_lock<std::mutex> l(g_jMx); g_jCv.wait(l, [] { return !g_jobs.empty(); }); j = std::move(g_jobs.front()); g_jobs.pop_front(); }
+        g_jCv.notify_all();
+        if (j.end) {
+            if (g_failedTake != j.takeId) {
+                wchar_t m[700];
+                if (j.realtime) swprintf_s(m, L"Finished (real-time): %lld frames actually presented by the game in %.2f s (%.2f fps measured) -> %s",
+                    (long long)j.endCount, j.wallSec, j.wallSec > 0 ? j.endCount / j.wallSec : 0.0, j.dir.c_str());
+                else swprintf_s(m, L"Finished (locked clock): %lld frames = %lld simulation steps at %lld/%lld fps, %lld clock slips -> %s",
+                    (long long)j.endCount, (long long)j.endCount, (long long)g_fpsNum, (long long)g_fpsDen, g_sh ? (long long)g_sh->slipEvents : 0LL, j.dir.c_str());
+                SetStatus(m);
+            }
+            if (j.testTarget > 0) VerifyTake(fac, j.dir, j.testTarget);
+            continue;
         }
-        D3D11_TEXTURE2D_DESC sd = d; sd.SampleDesc.Count = 1; sd.SampleDesc.Quality = 0; sd.Usage = D3D11_USAGE_STAGING;
-        sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0; sd.MipLevels = 1; sd.ArraySize = 1;
-        if (resolved) sd.Format = Typed(d.Format);
-        if (FAILED(dev->CreateTexture2D(&sd, nullptr, &st))) break;
-        ctx->CopySubresourceRegion(st, 0, 0, 0, 0, src, 0, nullptr);
-        D3D11_MAPPED_SUBRESOURCE m;
-        if (FAILED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) break;   // waits for the GPU to finish the frame
-        fr.alloc((int)d.Width, (int)d.Height);
-        Convert(pf, (const uint8_t*)m.pData, m.RowPitch, fr.w, fr.h, fr.bgr.data());
-        ctx->Unmap(st, 0);
+        if (j.takeId == g_failedTake) {
+            if (j.slot) {
+                HRESULT discardHr = S_OK; const wchar_t* discardStage = L"D3D12 discard fence wait";
+                if (!WaitD12JobFence(j, ev, discardHr, discardStage)) {
+                    Log(L"[D3D12] discarding frame %lld after prior failure; slot retired at '%s' hr=0x%08X",
+                        (long long)j.idx, discardStage, (unsigned)discardHr);
+                    RetireD12Slot(j.slot);
+                }
+                ReleaseSlot(j.slot);
+            }
+            continue; // keep output contiguous after a failure
+        }
+        wchar_t path[MAX_PATH + 32]; swprintf_s(path, L"%s\\frame_%06lld.jpg", j.dir.c_str(), (long long)j.idx);
+        bool v = j.idx < 2;
+        const wchar_t* stage = L"WIC factory"; HRESULT e = hf; bool ok = false; bool slotUnsafe = false;
+        do {
+            const uint8_t* src = j.raw.data(); size_t pitch = j.pitch; void* mapped = nullptr;
+            if (j.slot) {
+                if (!WaitD12JobFence(j, ev, e, stage)) { slotUnsafe = true; break; }
+                if (v) Log(L"[D3D12] frame %lld: copy fence %llu completed", (long long)j.idx, j.fenceVal);
+                // Even if WIC failed to initialize, wait for the GPU before releasing this slot.
+                if (!fac) { stage = L"WIC factory"; e = hf; break; }
+                stage = L"D3D12 readback Map";
+                D3D12_RANGE r = { (SIZE_T)j.offset, (SIZE_T)(j.offset + j.size) };
+                e = j.slot->rb->Map(0, &r, &mapped); if (FAILED(e)) { slotUnsafe = true; break; }
+                src = (const uint8_t*)mapped + j.offset;
+                if (v) Log(L"[D3D12] frame %lld: Map OK (rowPitch %zu, %llu bytes)", (long long)j.idx, pitch, j.size);
+            }
+            if (!fac) break;
+            stage = L"pixel conversion";
+            bgr.resize((size_t)j.w * j.h * 3);
+            Convert(j.pf, src, pitch, j.w, j.h, bgr.data());
+            if (mapped) { D3D12_RANGE wr = { 0, 0 }; j.slot->rb->Unmap(0, &wr); }
+            if (j.slot) { ReleaseSlot(j.slot); j.slot = nullptr; }
+            if (v) Log(L"frame %lld: converted %dx%d (pf %d) -> BGR24", (long long)j.idx, j.w, j.h, (int)j.pf);
+            ok = EncodeJpeg(fac, path, j.w, j.h, bgr.data(), v, e, stage);
+        } while (0);
+        if (j.slot) {
+            if (slotUnsafe) RetireD12Slot(j.slot); // GPU may still use them: leak, never reuse
+            ReleaseSlot(j.slot);
+        }
+        if (ok) {
+            if (g_sh) { InterlockedExchange64(&g_sh->framesSaved, j.idx + 1); g_sh->width = j.w; g_sh->height = j.h; }
+            if (v || j.idx % 100 == 0) Log(L"Saved %s", path);
+        } else {
+            Log(L"FAIL frame %lld path %s", (long long)j.idx, path);
+            ReportAsyncFailure(j.takeId, j.idx, stage, e);
+        }
+    }
+}
+
+// ============================================================ Direct3D 11 capture (staging ring, non-blocking Map)
+struct D11Ent { ID3D11Texture2D* tex = nullptr; int64_t idx = 0; int takeId = 0; std::wstring dir; };
+static struct { ID3D11Device* dev = nullptr; ID3D11DeviceContext* ctx = nullptr; D11Ent e[3]; int head = 0, count = 0;
+                D3D11_TEXTURE2D_DESC desc = {}; ID3D11Texture2D* resolved = nullptr; PF pf = PF::BGRA8; } g11;
+
+// Map the oldest pending staging copy. Returns 1 = queued, 0 = not ready, -1 = error.
+static int D11CollectOne(bool block) {
+    if (!g11.count) return 0;
+    D11Ent& e = g11.e[g11.head];
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    HRESULT hr = g11.ctx->Map(e.tex, 0, D3D11_MAP_READ, block ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return 0;
+    g11.head = (g11.head + 1) % 3; g11.count--;
+    if (FAILED(hr)) {
+        Log(L"[D3D11] staging Map failed hr=0x%08X, device removed reason 0x%08X", (unsigned)hr, (unsigned)g11.dev->GetDeviceRemovedReason());
+        if (g_failedTake != e.takeId) ReportAsyncFailure(e.takeId, e.idx, L"D3D11 staging Map", hr);
+        return -1;
+    }
+    Job j; j.takeId = e.takeId; j.idx = e.idx; j.dir = e.dir; j.w = (int)g11.desc.Width; j.h = (int)g11.desc.Height; j.pf = g11.pf;
+    j.pitch = (size_t)j.w * BppOf(j.pf); j.raw.resize(j.pitch * j.h);
+    for (int y = 0; y < j.h; y++) memcpy(j.raw.data() + (size_t)y * j.pitch, (const uint8_t*)m.pData + (size_t)y * m.RowPitch, j.pitch);
+    g11.ctx->Unmap(e.tex, 0);
+    if (e.idx < 2) Log(L"[D3D11] frame %lld: staging Map OK (%s, rowPitch %u)", (long long)e.idx, block ? L"blocking" : L"ready", m.RowPitch);
+    Enqueue(std::move(j));
+    return 1;
+}
+static bool D11Drain() { bool ok = true; while (g11.count) if (D11CollectOne(true) < 0) ok = false; return ok; }
+static void D11ReleaseRing() {
+    for (auto& e : g11.e) if (e.tex) { e.tex->Release(); e.tex = nullptr; }
+    if (g11.resolved) { g11.resolved->Release(); g11.resolved = nullptr; }
+    g11.head = g11.count = 0; g11.desc = {};
+}
+static bool SubmitD3D11(IDXGISwapChain* sc, ID3D11Device* dev, int64_t idx, bool v, const wchar_t*& stage, HRESULT& hr) {
+    ID3D11Texture2D* bb = nullptr; bool ok = false;
+    do {
+        if (g11.dev != dev) {
+            if (g11.dev) { D11Drain(); D11ReleaseRing(); g11.ctx->Release(); g11.dev->Release(); }
+            dev->AddRef(); g11.dev = dev; dev->GetImmediateContext(&g11.ctx);
+            Log(L"[D3D11] device %p, feature level 0x%X", dev, (unsigned)dev->GetFeatureLevel());
+        }
+        stage = L"D3D11 SwapChain::GetBuffer(0)"; hr = sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb); if (FAILED(hr)) break;
+        D3D11_TEXTURE2D_DESC d; bb->GetDesc(&d);
+        if (v) {
+            DXGI_SWAP_CHAIN_DESC sd = {}; HRESULT hs = sc->GetDesc(&sd);
+            Log(L"[D3D11] frame %lld: swapchain GetDesc hr=0x%08X %ux%u fmt %d buffers %u swapEffect %d | backbuffer(0) %ux%u fmt %d samples %u",
+                (long long)idx, (unsigned)hs, sd.BufferDesc.Width, sd.BufferDesc.Height, (int)sd.BufferDesc.Format, sd.BufferCount, (int)sd.SwapEffect,
+                d.Width, d.Height, (int)d.Format, d.SampleDesc.Count);
+        }
+        PF pf; stage = L"D3D11 back buffer format"; if (!PFFromDXGI(d.Format, pf)) { hr = E_NOTIMPL; break; }
+        if (d.Width != g11.desc.Width || d.Height != g11.desc.Height || d.Format != g11.desc.Format || d.SampleDesc.Count != g11.desc.SampleDesc.Count) {
+            D11Drain(); D11ReleaseRing(); g11.desc = d; g11.pf = pf;
+        }
+        stage = L"D3D11 collect finished copies";
+        int r; while ((r = D11CollectOne(false)) > 0) {}
+        if (r < 0) { hr = E_FAIL; break; }
+        if (g11.count == 3) {                      // ring full: backpressure (wait for the oldest copy)
+            int64_t t0 = RealQPC();
+            if (D11CollectOne(true) < 0) { hr = E_FAIL; break; }
+            Log(L"Backpressure: D3D11 waited %.1f ms for GPU copy (frame %lld)", RealMs(RealQPC() - t0), (long long)idx);
+        }
+        int slot = (g11.head + g11.count) % 3; D11Ent& e = g11.e[slot];
+        DXGI_FORMAT copyFmt = d.SampleDesc.Count > 1 ? Typed(d.Format) : d.Format;
+        if (!e.tex) {
+            D3D11_TEXTURE2D_DESC sd = d; sd.SampleDesc.Count = 1; sd.SampleDesc.Quality = 0; sd.Usage = D3D11_USAGE_STAGING; sd.Format = copyFmt;
+            sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0; sd.MipLevels = 1; sd.ArraySize = 1;
+            stage = L"D3D11 CreateTexture2D(staging)"; hr = dev->CreateTexture2D(&sd, nullptr, &e.tex); if (FAILED(hr)) break;
+        }
+        ID3D11Texture2D* src = bb;
+        if (d.SampleDesc.Count > 1) {
+            if (!g11.resolved) {
+                D3D11_TEXTURE2D_DESC rd = d; rd.SampleDesc.Count = 1; rd.SampleDesc.Quality = 0; rd.Format = copyFmt;
+                rd.Usage = D3D11_USAGE_DEFAULT; rd.BindFlags = 0; rd.CPUAccessFlags = 0; rd.MiscFlags = 0; rd.MipLevels = 1; rd.ArraySize = 1;
+                stage = L"D3D11 CreateTexture2D(MSAA resolve)"; hr = dev->CreateTexture2D(&rd, nullptr, &g11.resolved); if (FAILED(hr)) break;
+            }
+            g11.ctx->ResolveSubresource(g11.resolved, 0, bb, 0, copyFmt); src = g11.resolved;
+        }
+        g11.ctx->CopyResource(e.tex, src);
+        e.idx = idx; e.takeId = g_takeId; e.dir = g_takeDir; g11.count++;
+        if (v) Log(L"[D3D11] frame %lld: CopyResource -> staging slot %d submitted", (long long)idx, slot);
         ok = true;
     } while (0);
-    if (st) st->Release(); if (resolved) resolved->Release(); if (ctx) ctx->Release(); bb->Release();
+    if (bb) bb->Release();
     return ok;
 }
 
-// ============================================================ Direct3D 12 capture
+// ============================================================ Direct3D 12 capture (readback ring + fence)
 static std::mutex g_qMx;
 static ID3D12CommandQueue* g_lastQueue = nullptr;
+static struct { ID3D12Device* dev = nullptr; ID3D12Fence* fence = nullptr; UINT64 fv = 0; D12Slot s[3]; int next = 0; } g12;
 
-static bool CaptureD3D12(IDXGISwapChain* sc, ID3D12Device* dev, ID3D12CommandQueue* q, Frame& fr) {
-    IDXGISwapChain3* sc3 = nullptr;
-    if (FAILED(sc->QueryInterface(IID_PPV_ARGS(&sc3)))) return false;
-    bool ok = false; bool ownQ = false;
-    ID3D12Resource* bb = nullptr; ID3D12Resource* rb = nullptr; ID3D12CommandAllocator* al = nullptr;
-    ID3D12GraphicsCommandList* cl = nullptr; ID3D12Fence* fence = nullptr; HANDLE ev = nullptr;
+static void D12WaitIdle() {
+    std::unique_lock<std::mutex> l(g_slotMx);
+    g_slotCv.wait(l, [] { for (auto& s : g12.s) if (s.busy) return false; return true; });
+}
+static HRESULT D12Ensure(ID3D12Device* dev, const wchar_t*& stage) {
+    if (g12.dev == dev) return S_OK;
+    D12WaitIdle();
+    for (auto& s : g12.s) { if (s.cl) s.cl->Release(); if (s.al) s.al->Release(); if (s.rb) s.rb->Release(); s = D12Slot(); }
+    if (g12.fence) g12.fence->Release(); g12.fence = nullptr;
+    if (g12.dev) g12.dev->Release(); g12.dev = nullptr;
+    stage = L"D3D12 CreateFence";
+    HRESULT hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g12.fence)); if (FAILED(hr)) return hr;
+    dev->AddRef(); g12.dev = dev; g12.fv = 0; g12.next = 0;
+    Log(L"[D3D12] capture context created for device %p", dev);
+    return S_OK;
+}
+static bool SubmitD3D12(IDXGISwapChain* sc, int64_t idx, bool v, const wchar_t*& stage, HRESULT& hr) {
+    IDXGISwapChain3* sc3 = nullptr; ID3D12CommandQueue* q = nullptr; ID3D12Device* dev = nullptr; ID3D12Resource* bb = nullptr;
+    D12Slot* s = nullptr; bool open = false, ok = false;
     do {
-        if (!q) { std::lock_guard<std::mutex> l(g_qMx); q = g_lastQueue; if (q) { q->AddRef(); ownQ = true; } }
-        if (!q) { SetStatus(L"D3D12: command queue not found yet (wait a few frames)"); break; }
-        UINT idx = sc3->GetCurrentBackBufferIndex();
-        if (FAILED(sc3->GetBuffer(idx, IID_PPV_ARGS(&bb)))) break;
+        stage = L"QueryInterface(IDXGISwapChain3)"; hr = sc->QueryInterface(IID_PPV_ARGS(&sc3)); if (FAILED(hr)) break;
+        // The swapchain's own queue: the copy is then ordered after the game's frame and before Present.
+        stage = L"SwapChain::GetDevice(ID3D12CommandQueue)"; hr = sc->GetDevice(IID_PPV_ARGS(&q));
+        if (FAILED(hr) || !q) {
+            HRESULT h0 = hr;
+            { std::lock_guard<std::mutex> l(g_qMx); q = g_lastQueue; if (q) q->AddRef(); }
+            if (!q) { stage = L"find D3D12 queue (not D3D11/D3D12 swapchain?)"; if (SUCCEEDED(hr)) hr = E_NOINTERFACE; break; }
+            Log(L"[D3D12] WARNING: GetDevice(queue) hr=0x%08X; falling back to last DIRECT queue %p seen in ExecuteCommandLists (may not be the present queue)", (unsigned)h0, q);
+            hr = S_OK;
+        }
+        D3D12_COMMAND_QUEUE_DESC qd = q->GetDesc();
+        stage = L"D3D12 queue type"; if (qd.Type != D3D12_COMMAND_LIST_TYPE_DIRECT) { hr = E_INVALIDARG; break; }
+        stage = L"CommandQueue::GetDevice"; hr = q->GetDevice(IID_PPV_ARGS(&dev)); if (FAILED(hr)) break;
+        hr = D12Ensure(dev, stage); if (FAILED(hr)) break;
+        UINT bi = sc3->GetCurrentBackBufferIndex();       // buffer about to be presented
+        stage = L"SwapChain3::GetBuffer(current)"; hr = sc3->GetBuffer(bi, IID_PPV_ARGS(&bb)); if (FAILED(hr)) break;
         D3D12_RESOURCE_DESC rd = bb->GetDesc();
-        PF pf; if (!PFFromDXGI(rd.Format, pf)) { SetStatus(L"Unsupported back buffer format (D3D12)"); break; }
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp; UINT64 total = 0;
+        if (v) {
+            DXGI_SWAP_CHAIN_DESC sd = {}; HRESULT hs = sc->GetDesc(&sd);
+            Log(L"[D3D12] frame %lld: device %p queue %p | swapchain GetDesc hr=0x%08X %ux%u fmt %d buffers %u | back buffer index %u: %llux%u fmt %d samples %u | state assumed PRESENT (required at Present)",
+                (long long)idx, dev, q, (unsigned)hs, sd.BufferDesc.Width, sd.BufferDesc.Height, (int)sd.BufferDesc.Format, sd.BufferCount,
+                bi, (unsigned long long)rd.Width, rd.Height, (int)rd.Format, rd.SampleDesc.Count);
+        }
+        PF pf; stage = L"D3D12 back buffer format"; if (!PFFromDXGI(rd.Format, pf)) { hr = E_NOTIMPL; break; }
+        stage = L"D3D12 MSAA back buffer"; if (rd.SampleDesc.Count > 1) { hr = E_NOTIMPL; break; }
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {}; UINT64 total = 0;
         dev->GetCopyableFootprints(&rd, 0, 1, 0, &fp, nullptr, nullptr, &total);
-        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
-        D3D12_RESOURCE_DESC bd = {}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = 1;
-        bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb)))) break;
-        if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al)))) break;
-        if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, IID_PPV_ARGS(&cl)))) break;
-        if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) break;
+        s = &g12.s[g12.next];
+        {   // backpressure: wait until the worker has finished with this slot (its fence completed + unmapped)
+            std::unique_lock<std::mutex> l(g_slotMx);
+            if (s->busy) { int64_t t0 = RealQPC(); g_slotCv.wait(l, [&] { return !s->busy; }); Log(L"Backpressure: D3D12 waited %.1f ms for readback slot (frame %lld)", RealMs(RealQPC() - t0), (long long)idx); }
+        }
+        if (s->size < total) {
+            if (s->rb) { s->rb->Release(); s->rb = nullptr; } s->size = 0;
+            D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC bd = {}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = 1;
+            bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            stage = L"D3D12 CreateCommittedResource(READBACK)";
+            hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&s->rb)); if (FAILED(hr)) break;
+            s->size = total;
+        }
+        if (!s->al) {
+            stage = L"D3D12 CreateCommandAllocator"; hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s->al)); if (FAILED(hr)) break;
+            stage = L"D3D12 CreateCommandList"; hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s->al, nullptr, IID_PPV_ARGS(&s->cl)); if (FAILED(hr)) break;
+            s->cl->Close();
+        }
+        // Slot is idle => its previous copy fence completed, so resetting the allocator is safe.
+        stage = L"D3D12 CommandAllocator::Reset"; hr = s->al->Reset(); if (FAILED(hr)) break;
+        stage = L"D3D12 CommandList::Reset"; hr = s->cl->Reset(s->al, nullptr); if (FAILED(hr)) break;
+        open = true;
         D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource = bb; b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.pResource = bb; b.Transition.Subresource = 0;
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        cl->ResourceBarrier(1, &b);
-        D3D12_TEXTURE_COPY_LOCATION dst = {}; dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = fp;
+        s->cl->ResourceBarrier(1, &b);
+        D3D12_TEXTURE_COPY_LOCATION dst = {}; dst.pResource = s->rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = fp;
         D3D12_TEXTURE_COPY_LOCATION srcl = {}; srcl.pResource = bb; srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; srcl.SubresourceIndex = 0;
-        cl->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE; b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        cl->ResourceBarrier(1, &b);
-        if (FAILED(cl->Close())) break;
-        ID3D12CommandList* lists[] = { cl };
+        s->cl->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE; b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;   // restore for Present
+        s->cl->ResourceBarrier(1, &b);
+        stage = L"D3D12 CommandList::Close"; hr = s->cl->Close(); open = false; if (FAILED(hr)) break;
+        ID3D12CommandList* lists[] = { s->cl };
         q->ExecuteCommandLists(1, lists);
-        ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        q->Signal(fence, 1);
-        if (fence->GetCompletedValue() < 1) { fence->SetEventOnCompletion(1, ev); WaitForSingleObject(ev, 10000); }
-        if (fence->GetCompletedValue() < 1) break;
-        void* p = nullptr; D3D12_RANGE r = { 0, (SIZE_T)total };
-        if (FAILED(rb->Map(0, &r, &p))) break;
-        fr.alloc((int)rd.Width, (int)rd.Height);
-        Convert(pf, (const uint8_t*)p + fp.Offset, fp.Footprint.RowPitch, fr.w, fr.h, fr.bgr.data());
-        D3D12_RANGE wr = { 0, 0 }; rb->Unmap(0, &wr);
+        UINT64 val = ++g12.fv;
+        stage = L"D3D12 CommandQueue::Signal"; hr = q->Signal(g12.fence, val);
+        { std::lock_guard<std::mutex> l(g_slotMx); s->busy = true; }   // copy is in flight from here on: never reset/reuse before fence
+        if (FAILED(hr)) { Log(L"[D3D12] Signal failed: slot %d retired (GPU may still use it)", g12.next); s->rb = nullptr; s->al = nullptr; s->cl = nullptr; s->size = 0; ReleaseSlot(s); break; }
+        if (v) Log(L"[D3D12] frame %lld: barrier PRESENT->COPY_SOURCE->PRESENT, CopyTextureRegion %ux%u rowPitch %u -> slot %d submitted, fence value %llu",
+            (long long)idx, fp.Footprint.Width, fp.Footprint.Height, fp.Footprint.RowPitch, g12.next, val);
+        Job j; j.takeId = g_takeId; j.idx = idx; j.dir = g_takeDir; j.w = (int)rd.Width; j.h = (int)rd.Height; j.pf = pf;
+        j.pitch = fp.Footprint.RowPitch; j.slot = s; j.fence = g12.fence; j.dev = g12.dev; j.fenceVal = val; j.offset = fp.Offset; j.size = total;
+        g12.next = (g12.next + 1) % 3;
+        Enqueue(std::move(j));
         ok = true;
     } while (0);
-    if (ev) CloseHandle(ev); if (fence) fence->Release(); if (cl) cl->Release(); if (al) al->Release();
-    if (rb) rb->Release(); if (bb) bb->Release(); if (ownQ) q->Release(); sc3->Release();
+    if (open && s && s->cl) s->cl->Close();
+    if (bb) bb->Release(); if (dev) dev->Release(); if (q) q->Release(); if (sc3) sc3->Release();
     return ok;
 }
 
-static bool CaptureDXGI(IDXGISwapChain* sc, Frame& fr) {
+static bool SubmitDXGI(IDXGISwapChain* sc, int64_t idx, bool v, const wchar_t*& stage, HRESULT& hr) {
     ID3D11Device* d11 = nullptr;
-    if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), (void**)&d11)) && d11) {
-        SetApi(L"Direct3D 11"); bool r = CaptureD3D11(sc, d11, fr); d11->Release(); return r;
-    }
-    ID3D10Device* d10 = nullptr;
-    if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D10Device), (void**)&d10)) && d10) {
-        SetApi(L"Direct3D 10"); bool r = CaptureD3D10(sc, d10, fr); d10->Release(); return r;
-    }
-    ID3D12CommandQueue* q = nullptr; ID3D12Device* d12 = nullptr;
-    sc->GetDevice(__uuidof(ID3D12CommandQueue), (void**)&q);
-    if (q) q->GetDevice(IID_PPV_ARGS(&d12)); else sc->GetDevice(IID_PPV_ARGS(&d12));
-    if (d12) { SetApi(L"Direct3D 12"); bool r = CaptureD3D12(sc, d12, q, fr); d12->Release(); if (q) q->Release(); return r; }
-    if (q) q->Release();
-    SetStatus(L"Unsupported DXGI device type");
-    return false;
+    hr = sc->GetDevice(__uuidof(ID3D11Device), (void**)&d11);
+    if (SUCCEEDED(hr) && d11) { SetApi(L"Direct3D 11"); g_api = Api::D11; bool r = SubmitD3D11(sc, d11, idx, v, stage, hr); d11->Release(); return r; }
+    if (v) Log(L"SwapChain::GetDevice(ID3D11Device) hr=0x%08X -> trying D3D12", (unsigned)hr);
+    SetApi(L"Direct3D 12"); g_api = Api::D12;
+    return SubmitD3D12(sc, idx, v, stage, hr);
+}
+// D3D9 / OpenGL: synchronous GPU readback (unchanged), encoding moved to the worker.
+static bool QueueCpuFrame(Frame& f, int64_t idx) {
+    if (f.w <= 0 || f.h <= 0) return false;
+    Job j; j.takeId = g_takeId; j.idx = idx; j.dir = g_takeDir; j.w = f.w; j.h = f.h; j.pf = PF::BGR24; j.pitch = (size_t)f.w * 3; j.raw = std::move(f.bgr);
+    Enqueue(std::move(j));
+    return true;
 }
 
-// ============================================================ Direct3D 9 capture
+// ============================================================ Direct3D 9 / OpenGL capture (synchronous readback)
 static bool CaptureD9Surface(IDirect3DDevice9* dev, IDirect3DSurface9* bb, Frame& fr) {
     D3DSURFACE_DESC d; if (FAILED(bb->GetDesc(&d))) return false;
     PF pf;
@@ -494,13 +794,9 @@ static bool CaptureGL(HDC hdc, Frame& fr) {
     auto glPixelStorei = (glPixelStorei_t)Proc(L"opengl32.dll", "glPixelStorei");
     auto glReadPixels = (glReadPixels_t)Proc(L"opengl32.dll", "glReadPixels");
     if (!pCur || !pGPA || !glGetIntegerv || !glReadBuffer || !glPixelStorei || !glReadPixels || !pCur()) return false;
-    auto validWglProc = [](PROC p) -> PROC {
-        const intptr_t v = (intptr_t)p;
-        return (!p || v == 1 || v == 2 || v == 3 || v == -1) ? nullptr : p;
-    };
-    auto glBindFramebuffer = (glBind_t)validWglProc(pGPA("glBindFramebuffer"));
-    if (!glBindFramebuffer) glBindFramebuffer = (glBind_t)validWglProc(pGPA("glBindFramebufferEXT"));
-    auto glBindBuffer = (glBind_t)validWglProc(pGPA("glBindBuffer"));
+    auto glBindFramebuffer = (glBind_t)pGPA("glBindFramebuffer");
+    if (!glBindFramebuffer) glBindFramebuffer = (glBind_t)pGPA("glBindFramebufferEXT");
+    auto glBindBuffer = (glBind_t)pGPA("glBindBuffer");
     HWND wnd = WindowFromDC(hdc); RECT rc;
     if (!wnd || !GetClientRect(wnd, &rc)) return false;
     int w = rc.right - rc.left, h = rc.bottom - rc.top; if (w <= 0 || h <= 0) return false;
@@ -516,99 +812,103 @@ static bool CaptureGL(HDC hdc, Frame& fr) {
     std::vector<uint8_t> tmp((size_t)w * h * 3);
     glReadPixels(0, 0, w, h, BGR, UBYTE, tmp.data());   // implicit GPU sync
     glPixelStorei(PACK_ALIGN, prevAlign); glPixelStorei(PACK_ROW_LEN, prevRow); glPixelStorei(PACK_SKIP_ROWS, prevSR); glPixelStorei(PACK_SKIP_PIX, prevSP);
-    if (glBindFramebuffer) glBindFramebuffer(READ_FB, (unsigned)prevFbo);
     glReadBuffer((unsigned)prevRead);
+    if (glBindFramebuffer) glBindFramebuffer(READ_FB, (unsigned)prevFbo);
     if (glBindBuffer) glBindBuffer(PACK_BUF, (unsigned)prevPbo);
     fr.alloc(w, h);
     size_t row = (size_t)w * 3;
-    for (int y = 0; y < h; y++) std::memcpy(fr.bgr.data() + (size_t)y * row, tmp.data() + (size_t)(h - 1 - y) * row, row);  // GL is bottom-up
+    for (int y = 0; y < h; y++) memcpy(fr.bgr.data() + (size_t)y * row, tmp.data() + (size_t)(h - 1 - y) * row, row);  // GL is bottom-up
     return true;
 }
 
-// ============================================================ frame stepping (the core)
-static std::mutex g_stepMx;
-static void* g_target = nullptr;     // swapchain/device/window being recorded
-static int g_fails = 0;
-static wchar_t g_takeDir[MAX_PATH];
-static thread_local bool t_inPresent = false;
-
-static void PollHotkey() {
-    static bool prev = false;
-    bool down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    if (down && !prev) InterlockedExchange(&g_sh->wantRecord, g_sh->wantRecord ? 0 : 1);
-    prev = down;
+// ============================================================ take control (runs inside Present hooks)
+static void PollHotkeys() {
+    static bool p9 = false, p10 = false;
+    bool d9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0, d10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    if (d9 && !p9) InterlockedExchange(&g_sh->wantRecord, g_sh->wantRecord ? 0 : 1);
+    if (d10 && !p10 && !g_rec) { InterlockedExchange(&g_sh->testFrames, 120); InterlockedExchange(&g_sh->wantRecord, 1); }
+    p9 = d9; p10 = d10;
 }
-static void StartRecording(void* obj) {
+static bool StartTake(void* obj) {
     LONG n = g_sh->fpsNum, d = g_sh->fpsDen;
     if (n <= 0 || d <= 0) { n = 24; d = 1; }
-    g_fpsNum = n; g_fpsDen = d;
     wchar_t base[MAX_PATH];
     wcsncpy_s(base, g_sh->outDir, _TRUNCATE);
     if (!base[0]) { GetEnvironmentVariableW(L"USERPROFILE", base, MAX_PATH); wcscat_s(base, L"\\Videos\\FrameLock"); }
     SYSTEMTIME st; GetLocalTime(&st);
-    swprintf_s(g_takeDir, L"%s\\Take_%04d%02d%02d_%02d%02d%02d", base, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    int r = SHCreateDirectoryExW(nullptr, g_takeDir, nullptr);
+    wchar_t dir[MAX_PATH];
+    swprintf_s(dir, L"%s\\Take_%04d%02d%02d_%02d%02d%02d", base, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    int r = SHCreateDirectoryExW(nullptr, dir, nullptr);
     if (r != ERROR_SUCCESS && r != ERROR_ALREADY_EXISTS) {
-        SetStatus(L"ERROR: cannot create output folder"); InterlockedExchange(&g_sh->wantRecord, 0); return;
+        wchar_t m[600]; swprintf_s(m, L"ERROR: cannot create output folder %s (Win32 error %d)", dir, r); SetStatus(m);
+        InterlockedExchange(&g_sh->wantRecord, 0); return false;
     }
-    wcsncpy_s(g_sh->takeDir, g_takeDir, _TRUNCATE);
-    InterlockedExchange64(&g_sh->framesSaved, 0);
-    g_recBase = RealQPC() + g_offset.load();   // freeze the clock at "now" (continuous)
-    g_frame.store(0);
-    g_target = obj; g_fails = 0;
-    g_rec.store(true, std::memory_order_release);
-    InterlockedExchange(&g_sh->isRecording, 1);
-    wchar_t msg[600]; swprintf_s(msg, L"Recording at %ld/%ld fps -> %s", n, d, g_takeDir); SetStatus(msg);
+    g_fpsNum = n; g_fpsDen = d;
+    g_takeDir = dir; wcsncpy_s(g_sh->takeDir, dir, _TRUNCATE);
+    g_lockMode = g_sh->mode != FL_MODE_REALTIME;
+    g_testTarget = InterlockedExchange(&g_sh->testFrames, 0);
+    InterlockedExchange64(&g_sh->framesSaved, 0); InterlockedExchange64(&g_sh->framesQueued, 0);
+    InterlockedExchange64(&g_sh->slipEvents, 0); InterlockedExchange(&g_sh->lastHr, 0);
+    g_takeId++; g_asyncFail = false; g_nextIdx = 0; g_fails = 0; g_target = obj; g_api = Api::None;
+    g_takeStartReal = RealQPC();
+    g_rec = true; InterlockedExchange(&g_sh->isRecording, 1);
+    wchar_t m[700];
+    swprintf_s(m, L"TAKE START: mode=%s, fps=%ld/%ld, test=%lld frames, target=%p -> %s",
+        g_lockMode ? L"LOCKED (offline export, 1 step per frame)" : L"REAL-TIME (only frames the game presents)", n, d, (long long)g_testTarget, obj, dir);
+    SetStatus(m);
+    return true;
 }
-static void StopRecording(bool okMsg) {
-    int64_t v = VirtQPC();
-    g_offset.store(v - RealQPC());   // keep time continuous after unfreezing
-    g_rec.store(false, std::memory_order_release);
-    g_target = nullptr;
-    InterlockedExchange(&g_sh->isRecording, 0);
-    if (okMsg) {
-        wchar_t msg[700]; swprintf_s(msg, L"Finished: %lld frames saved to %s", (long long)g_sh->framesSaved, g_takeDir); SetStatus(msg);
-    }
+static void StopTake(const wchar_t* why) {
+    if (g_api == Api::D11 && !D11Drain()) D11ReleaseRing();   // queue remaining in-flight D3D11 copies
+    ClockStop();
+    double wall = (RealQPC() - g_takeStartReal) / (double)g_freq;
+    g_rec = false; g_target = nullptr;
+    InterlockedExchange(&g_sh->isRecording, 0); InterlockedExchange(&g_sh->wantRecord, 0);
+    Log(L"TAKE STOP (%s): %lld frames queued, waiting for encoder", why, (long long)g_nextIdx);
+    Job e; e.end = true; e.takeId = g_takeId; e.dir = g_takeDir; e.endCount = g_nextIdx; e.testTarget = g_testTarget; e.realtime = !g_lockMode; e.wallSec = wall;
+    Enqueue(std::move(e));
 }
 
-// Called on every Present BEFORE the original Present.
-template <class Cap> static void FrameStep(void* obj, Cap& cap) {
-    if (!g_sh) return;
+// Before the original Present. Returns 0 = nothing, 1 = take started, 2 = frame queued.
+// Cap: bool(int64_t idx, bool verbose, const wchar_t*& stage, HRESULT& hr) - submits capture of the completed frame.
+template <class Cap> static int FrameStepPre(void* obj, Cap& cap) {
+    if (!g_sh) return 0;
     std::lock_guard<std::mutex> lk(g_stepMx);
-    PollHotkey();
+    PollHotkeys();
     bool want = InterlockedCompareExchange(&g_sh->wantRecord, 0, 0) != 0;
-    if (!g_rec.load()) { if (want) StartRecording(obj); return; }
-    if (obj != g_target) return;                        // ignore other windows/swapchains
-    Frame f;
-    if (!cap(f) || f.w <= 0 || f.h <= 0) {               // do NOT advance time: frame will be retried
-        if (++g_fails >= 3) {
-            SetStatus(L"ERROR: frame capture failed 3 times in a row - recording stopped (no frame was skipped).");
-            InterlockedExchange(&g_sh->wantRecord, 0); StopRecording(false);
-        }
-        return;
+    if (!g_rec) return (want && StartTake(obj)) ? 1 : 0;
+    if (obj != g_target) return 0;                       // other windows/swapchains
+    if (g_asyncFail) { StopTake(L"async failure"); return 0; }
+    if (!want) { StopTake(L"user"); return 0; }
+    int64_t n = g_nextIdx;
+    const wchar_t* stage = L"capture"; HRESULT hr = E_FAIL;
+    if (!cap(n, n < 2, stage, hr)) {                    // nothing queued: index and clock NOT advanced
+        InterlockedExchange(&g_sh->lastHr, (LONG)hr);
+        wchar_t m[512]; swprintf_s(m, L"Capture of frame_%06lld failed at stage '%s' (HRESULT 0x%08X), attempt %d/3", (long long)n, stage, (unsigned)hr, g_fails + 1);
+        SetStatus(m);
+        if (++g_fails >= 3) { SetStatus(L"ERROR: capture failed 3 times in a row - recording stopped (see previous line for stage/HRESULT). No frame index was skipped."); StopTake(L"capture failure"); }
+        return 0;
     }
     g_fails = 0;
-    int64_t n = g_frame.load();
-    wchar_t path[MAX_PATH + 32];
-    swprintf_s(path, L"%s\\frame_%06lld.jpg", g_takeDir, (long long)n);
-    if (!SaveJpegSync(path, f.w, f.h, f.bgr.data())) {   // blocks until the file is on disk
-        SetStatus(L"ERROR: could not write JPEG (disk full / no permission?) - recording stopped.");
-        InterlockedExchange(&g_sh->wantRecord, 0); StopRecording(false); return;
-    }
-    g_sh->width = f.w; g_sh->height = f.h;
-    InterlockedExchange64(&g_sh->framesSaved, n + 1);
-    g_frame.store(n + 1, std::memory_order_release);   // advance game time by exactly 1/FPS
-    if (!want) StopRecording(true);
+    g_nextIdx = n + 1;                                   // advance only after the frame is safely queued
+    InterlockedExchange64(&g_sh->framesQueued, n + 1);
+    if (g_testTarget > 0 && n + 1 >= g_testTarget) InterlockedExchange(&g_sh->wantRecord, 0);   // stops at next Present
+    return 2;
 }
-
+static void FrameStepPost(int r) {
+    if (!g_lockMode) return;                             // real-time: clock never touched
+    if (r == 1) ClockStart();                            // step 0 starts after the start Present
+    else if (r == 2 && g_rec) ClockAdvance();            // exactly one step per queued frame
+}
 template <class Cap, class Call>
 static auto PresentWrap(void* obj, Cap cap, Call call) -> decltype(call()) {
     if (t_inPresent) return call();          // nested present (e.g. Present -> Present1)
     t_inPresent = true;
-    FrameStep(obj, cap);
-    auto r = call();
+    int r = FrameStepPre(obj, cap);
+    auto res = call();
+    FrameStepPost(r);
     t_inPresent = false;
-    return r;
+    return res;
 }
 
 // ============================================================ present hooks
@@ -623,15 +923,17 @@ typedef BOOL(WINAPI* SwapLayer_t)(HDC, UINT);
 
 static Present_t o_Present = nullptr; static Present1_t o_Present1 = nullptr; static ECL_t o_ECL = nullptr;
 static D9Present_t o_D9Present = nullptr, o_D9Present2 = nullptr; static D9PresentEx_t o_D9PresentEx = nullptr; static D9SwPresent_t o_D9SwPresent = nullptr;
-static Swap_t o_wglSwap = nullptr, o_gdiSwap = nullptr; static SwapLayer_t o_wglSwapLayer = nullptr;
+static Swap_t o_gdiSwap = nullptr; static SwapLayer_t o_wglSwapLayer = nullptr;
+
+#define CPU_CAP(expr, api) [&](int64_t idx, bool, const wchar_t*& stage, HRESULT& hr) { g_api = api; Frame f; stage = L"synchronous readback"; hr = E_FAIL; if (!(expr)) return false; hr = S_OK; return QueueCpuFrame(f, idx); }
 
 static HRESULT STDMETHODCALLTYPE Hk_Present(IDXGISwapChain* sc, UINT sync, UINT flags) {
     if (flags & DXGI_PRESENT_TEST) return o_Present(sc, sync, flags);
-    return PresentWrap(sc, [&](Frame& f) { return CaptureDXGI(sc, f); }, [&] { return o_Present(sc, sync, flags); });
+    return PresentWrap(sc, [&](int64_t i, bool v, const wchar_t*& s, HRESULT& h) { return SubmitDXGI(sc, i, v, s, h); }, [&] { return o_Present(sc, sync, flags); });
 }
 static HRESULT STDMETHODCALLTYPE Hk_Present1(IDXGISwapChain1* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp) {
     if (flags & DXGI_PRESENT_TEST) return o_Present1(sc, sync, flags, pp);
-    return PresentWrap((IDXGISwapChain*)sc, [&](Frame& f) { return CaptureDXGI(sc, f); }, [&] { return o_Present1(sc, sync, flags, pp); });
+    return PresentWrap((IDXGISwapChain*)sc, [&](int64_t i, bool v, const wchar_t*& s, HRESULT& h) { return SubmitDXGI(sc, i, v, s, h); }, [&] { return o_Present1(sc, sync, flags, pp); });
 }
 static void STDMETHODCALLTYPE Hk_ECL(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
     D3D12_COMMAND_QUEUE_DESC d = q->GetDesc();
@@ -642,26 +944,23 @@ static void STDMETHODCALLTYPE Hk_ECL(ID3D12CommandQueue* q, UINT n, ID3D12Comman
     o_ECL(q, n, lists);
 }
 static HRESULT STDMETHODCALLTYPE Hk_D9Present(IDirect3DDevice9* d, const RECT* s, const RECT* r, HWND w, const RGNDATA* rg) {
-    return PresentWrap(d, [&](Frame& f) { return CaptureD9Dev(d, f); }, [&] { return o_D9Present(d, s, r, w, rg); });
+    return PresentWrap(d, CPU_CAP(CaptureD9Dev(d, f), Api::D9), [&] { return o_D9Present(d, s, r, w, rg); });
 }
 static HRESULT STDMETHODCALLTYPE Hk_D9Present2(IDirect3DDevice9* d, const RECT* s, const RECT* r, HWND w, const RGNDATA* rg) {
-    return PresentWrap(d, [&](Frame& f) { return CaptureD9Dev(d, f); }, [&] { return o_D9Present2(d, s, r, w, rg); });
+    return PresentWrap(d, CPU_CAP(CaptureD9Dev(d, f), Api::D9), [&] { return o_D9Present2(d, s, r, w, rg); });
 }
 static HRESULT STDMETHODCALLTYPE Hk_D9PresentEx(IDirect3DDevice9Ex* d, const RECT* s, const RECT* r, HWND w, const RGNDATA* rg, DWORD fl) {
-    return PresentWrap((IDirect3DDevice9*)d, [&](Frame& f) { return CaptureD9Dev(d, f); }, [&] { return o_D9PresentEx(d, s, r, w, rg, fl); });
+    return PresentWrap((IDirect3DDevice9*)d, CPU_CAP(CaptureD9Dev(d, f), Api::D9), [&] { return o_D9PresentEx(d, s, r, w, rg, fl); });
 }
 static HRESULT STDMETHODCALLTYPE Hk_D9SwPresent(IDirect3DSwapChain9* sw, const RECT* s, const RECT* r, HWND w, const RGNDATA* rg, DWORD fl) {
     IDirect3DDevice9* dev = nullptr; sw->GetDevice(&dev); if (dev) dev->Release();   // device pointer used as target id
-    return PresentWrap(dev ? (void*)dev : (void*)sw, [&](Frame& f) { return CaptureD9Swap(sw, f); }, [&] { return o_D9SwPresent(sw, s, r, w, rg, fl); });
-}
-static BOOL WINAPI Hk_wglSwap(HDC hdc) {
-    return PresentWrap(WindowFromDC(hdc), [&](Frame& f) { return CaptureGL(hdc, f); }, [&] { return o_wglSwap(hdc); });
+    return PresentWrap(dev ? (void*)dev : (void*)sw, CPU_CAP(CaptureD9Swap(sw, f), Api::D9), [&] { return o_D9SwPresent(sw, s, r, w, rg, fl); });
 }
 static BOOL WINAPI Hk_gdiSwap(HDC hdc) {
-    return PresentWrap(WindowFromDC(hdc), [&](Frame& f) { return CaptureGL(hdc, f); }, [&] { return o_gdiSwap(hdc); });
+    return PresentWrap(WindowFromDC(hdc), CPU_CAP(CaptureGL(hdc, f), Api::GL), [&] { return o_gdiSwap(hdc); });
 }
 static BOOL WINAPI Hk_wglSwapLayer(HDC hdc, UINT planes) {
-    return PresentWrap(WindowFromDC(hdc), [&](Frame& f) { return CaptureGL(hdc, f); }, [&] { return o_wglSwapLayer(hdc, planes); });
+    return PresentWrap(WindowFromDC(hdc), CPU_CAP(CaptureGL(hdc, f), Api::GL), [&] { return o_wglSwapLayer(hdc, planes); });
 }
 
 // ============================================================ hook installers (dummy devices -> vtables)
@@ -744,10 +1043,10 @@ static bool HookD3D9() {
     return ok;
 }
 static bool HookGL() {
-    bool ok = Hook(Proc(L"opengl32.dll", "wglSwapBuffers"), (void*)Hk_wglSwap, (void**)&o_wglSwap, "wglSwapBuffers");
-    Hook(Proc(L"opengl32.dll", "wglSwapLayerBuffers"), (void*)Hk_wglSwapLayer, (void**)&o_wglSwapLayer, "wglSwapLayerBuffers");
-    Hook(Proc(L"gdi32.dll", "SwapBuffers"), (void*)Hk_gdiSwap, (void**)&o_gdiSwap, "gdi32!SwapBuffers");
-    return ok;
+    // The Win32 SwapBuffers entry point is exported by GDI32 (not opengl32).
+    bool swap = Hook(Proc(L"gdi32.dll", "SwapBuffers"), (void*)Hk_gdiSwap, (void**)&o_gdiSwap, "gdi32!SwapBuffers");
+    bool layer = Hook(Proc(L"opengl32.dll", "wglSwapLayerBuffers"), (void*)Hk_wglSwapLayer, (void**)&o_wglSwapLayer, "wglSwapLayerBuffers");
+    return swap || layer;
 }
 
 // ============================================================ init
@@ -767,11 +1066,13 @@ static DWORD WINAPI InitThread(LPVOID) {
     OpenShared();
     if (!g_sh) { Log(L"Shared memory failed"); return 0; }
     InitLut();
-    CreateThread(nullptr, 0, WriterThread, nullptr, 0, nullptr);
+    HANDLE worker = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
+    if (!worker) { SetStatus(L"ERROR: could not start the JPEG encoder thread"); return 0; }
+    CloseHandle(worker);
     if (MH_Initialize() != MH_OK) { SetStatus(L"ERROR: MinHook init failed"); return 0; }
     InstallTimeHooks();
     InterlockedExchange(&g_sh->hooksReady, 1);
-    SetStatus(L"Hooks active. Waiting for the game to render... Press Record or F9.");
+    SetStatus(L"Hooks active (v2). Waiting for the game to render... Record = F9, 120-frame self-test = F10.");
     bool dxgi = false, d12 = false, d9 = false, gl = false; int tDxgi = 0, tD12 = 0, tD9 = 0, tGl = 0;
     for (;;) {   // graphics DLLs may be loaded later: keep scanning
         if (!dxgi && tDxgi < 5 && GetModuleHandleW(L"dxgi.dll")) { dxgi = HookDXGI(); tDxgi++; }

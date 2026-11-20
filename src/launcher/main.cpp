@@ -12,9 +12,9 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <cstdlib>
 #include <cmath>
 #include <cwchar>
-#include <cstdlib>
 #include "../shared.h"
 
 #ifdef _WIN64
@@ -25,8 +25,8 @@
 #define APP_TITLE L"FrameLock Recorder (32-bit games)"
 #endif
 
-enum { IDC_PROC = 101, IDC_REFRESH, IDC_LAUNCH, IDC_FPS, IDC_OUT, IDC_BROWSE, IDC_ATTACH, IDC_RECORD, IDC_STATUS };
-static HWND g_wnd, hProc, hFps, hOut, hRecord, hStatus;
+enum { IDC_PROC = 101, IDC_REFRESH, IDC_LAUNCH, IDC_FPS, IDC_OUT, IDC_BROWSE, IDC_ATTACH, IDC_RECORD, IDC_STATUS, IDC_REALTIME, IDC_TEST };
+static HWND g_wnd, hProc, hFps, hOut, hRecord, hStatus, hRealtime;
 static std::vector<DWORD> g_pids;
 static DWORD g_pid = 0; static HANDLE g_hProcess = nullptr;
 static HANDLE g_map = nullptr; static FLShared* g_sh = nullptr;
@@ -56,30 +56,13 @@ static void RefreshProcs() {
     if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
 }
 static bool ParseFps(const wchar_t* s, LONG& num, LONG& den) {
-    if (!s || !*s) return false;
-    if (const wchar_t* slash = wcschr(s, L'/')) {
-        wchar_t* endNum = nullptr;
-        wchar_t* endDen = nullptr;
-        long long a = _wcstoi64(s, &endNum, 10);
-        long long b = _wcstoi64(slash + 1, &endDen, 10);
-        if (endNum != slash || !endDen || *endDen != L'\0' || a <= 0 || b <= 0) return false;
-        long long x = a, y = b;
-        while (y) { long long t = x % y; x = y; y = t; }
-        a /= x; b /= x;
-        const double rate = (double)a / (double)b;
-        if (rate < 0.1 || rate > 1000.0 || a > 1000000 || b > 1000000) return false;
-        num = (LONG)a; den = (LONG)b;
-        return true;
-    }
-    wchar_t* end = nullptr;
-    double v = wcstod(s, &end);
-    if (end == s || !end || *end != L'\0' || !std::isfinite(v) || v < 0.1 || v > 1000.0) return false;
+    if (const wchar_t* sl = wcschr(s, L'/')) { num = _wtol(s); den = _wtol(sl + 1); return num > 0 && den > 0; }
+    double v = _wtof(s); if (v <= 0 || v > 1000) return false;
     struct { double v; LONG n, d; } sp[] = { {23.976,24000,1001},{29.97,30000,1001},{47.952,48000,1001},{59.94,60000,1001},{119.88,120000,1001} };
     for (auto& x : sp) if (fabs(v - x.v) < 0.002) { num = x.n; den = x.d; return true; }
-    num = (LONG)llround(v * 1000.0); den = 1000;
+    num = (LONG)llround(v * 1000); den = 1000;
     LONG a = num, b = den; while (b) { LONG t = a % b; a = b; b = t; }
-    num /= a; den /= a;
-    return true;
+    num /= a; den /= a; return true;
 }
 static bool OpenShared(DWORD pid) {
     if (g_sh) { UnmapViewOfFile(g_sh); g_sh = nullptr; } if (g_map) { CloseHandle(g_map); g_map = nullptr; }
@@ -88,7 +71,7 @@ static bool OpenShared(DWORD pid) {
     bool existed = GetLastError() == ERROR_ALREADY_EXISTS;
     if (!g_map) return false;
     g_sh = (FLShared*)MapViewOfFile(g_map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(FLShared));
-    if (!g_sh) { CloseHandle(g_map); g_map = nullptr; return false; }
+    if (!g_sh) return false;
     if (!existed || g_sh->magic != FL_MAGIC) { ZeroMemory(g_sh, sizeof(FLShared)); g_sh->magic = FL_MAGIC; g_sh->fpsNum = 24; g_sh->fpsDen = 1; }
     return true;
 }
@@ -102,41 +85,20 @@ static bool Inject(DWORD pid, std::wstring& err) {
     if (tw != sw) { CloseHandle(p); err = sw ? L"This game is 64-bit: use FrameLock64.exe." : L"This game is 32-bit: use FrameLock32.exe."; return false; }
     size_t bytes = (wcslen(dll) + 1) * sizeof(wchar_t);
     void* mem = VirtualAllocEx(p, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!mem) { CloseHandle(p); err = L"Allocating memory in the game process failed."; return false; }
-    if (!WriteProcessMemory(p, mem, dll, bytes, nullptr)) {
-        VirtualFreeEx(p, mem, 0, MEM_RELEASE); CloseHandle(p);
-        err = L"Writing to the game process failed."; return false;
-    }
+    if (!mem || !WriteProcessMemory(p, mem, dll, bytes, nullptr)) { CloseHandle(p); err = L"Writing to the game process failed."; return false; }
     auto ll = (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
-    if (!ll) { VirtualFreeEx(p, mem, 0, MEM_RELEASE); CloseHandle(p); err = L"Could not locate LoadLibraryW."; return false; }
     HANDLE t = CreateRemoteThread(p, nullptr, 0, ll, mem, 0, nullptr);
     if (!t) { VirtualFreeEx(p, mem, 0, MEM_RELEASE); CloseHandle(p); err = L"CreateRemoteThread failed (anti-cheat or protected process?)."; return false; }
-    DWORD waitResult = WaitForSingleObject(t, 15000);
-    DWORD code = 0;
-    if (waitResult == WAIT_OBJECT_0) GetExitCodeThread(t, &code);
-    CloseHandle(t);
-    if (waitResult != WAIT_OBJECT_0) {
-        // Do not free the remote string while a timed-out loader thread may still use it.
-        CloseHandle(p);
-        err = L"The game did not finish loading the hook within 15 seconds. No recording was started.";
-        return false;
-    }
+    WaitForSingleObject(t, 15000); DWORD code = 0; GetExitCodeThread(t, &code); CloseHandle(t);
     VirtualFreeEx(p, mem, 0, MEM_RELEASE);
     if (!code) { CloseHandle(p); err = L"LoadLibrary failed inside the game (blocked by anti-cheat?)."; return false; }
     if (g_hProcess) CloseHandle(g_hProcess); g_hProcess = p;
     return true;
 }
 static void Attach(DWORD pid) {
-    if (g_pid == pid && g_sh) { Msg(L"This game is already attached."); return; }
-    if (g_hProcess) { CloseHandle(g_hProcess); g_hProcess = nullptr; }
-    g_pid = 0;
     if (!OpenShared(pid)) { Msg(L"Shared memory creation failed."); return; }
     std::wstring err;
-    if (!Inject(pid, err)) {
-        if (g_sh) { UnmapViewOfFile(g_sh); g_sh = nullptr; }
-        if (g_map) { CloseHandle(g_map); g_map = nullptr; }
-        Msg(err.c_str()); return;
-    }
+    if (!Inject(pid, err)) { Msg(err.c_str()); return; }
     g_pid = pid;
 }
 static bool ApplySettings() {
@@ -147,6 +109,7 @@ static bool ApplySettings() {
     int r = SHCreateDirectoryExW(nullptr, out, nullptr);
     if (r != ERROR_SUCCESS && r != ERROR_ALREADY_EXISTS) { Msg(L"Cannot create the output folder."); return false; }
     g_sh->fpsNum = n; g_sh->fpsDen = d; wcsncpy_s(g_sh->outDir, out, _TRUNCATE);
+    InterlockedExchange(&g_sh->mode, SendMessageW(hRealtime, BM_GETCHECK, 0, 0) == BST_CHECKED ? FL_MODE_REALTIME : FL_MODE_LOCKED);
     return true;
 }
 static void ToggleRecord() {
@@ -154,6 +117,12 @@ static void ToggleRecord() {
     if (!g_sh->hooksReady) { Msg(L"Hooks are not ready yet. Wait a second and try again."); return; }
     if (!g_sh->wantRecord) { if (ApplySettings()) InterlockedExchange(&g_sh->wantRecord, 1); }
     else InterlockedExchange(&g_sh->wantRecord, 0);
+}
+static void StartTest() {
+    if (!g_sh || !g_pid) { Msg(L"Attach to a game first."); return; }
+    if (!g_sh->hooksReady) { Msg(L"Hooks are not ready yet. Wait a second and try again."); return; }
+    if (g_sh->wantRecord || g_sh->isRecording) { Msg(L"Stop the current recording first."); return; }
+    if (ApplySettings()) { InterlockedExchange(&g_sh->testFrames, 120); InterlockedExchange(&g_sh->wantRecord, 1); }
 }
 static BOOL CALLBACK FindPidWin(HWND w, LPARAM lp) {
     DWORD pid; GetWindowThreadProcessId(w, &pid);
@@ -182,9 +151,9 @@ static void UpdateStatus() {
     if (!g_sh || !g_pid) { swprintf_s(txt, L"Not attached. Start your game, select it above and press Attach.%s", g_launchPid ? L"\r\nWaiting for launched game window..." : L""); }
     else {
         swprintf_s(txt, L"Attached to PID %lu   |   Hooks: %s   |   API: %s   |   Resolution: %ld x %ld\r\n"
-            L"State: %s   |   Frames saved: %lld\r\nTake folder: %s\r\n%s",
+            L"State: %s (%s)   |   Frames queued: %lld   saved: %lld   |   Clock slips: %lld   |   Last HRESULT: 0x%08X\r\nTake folder: %s\r\n%s",
             g_pid, g_sh->hooksReady ? L"active" : L"loading", g_sh->api[0] ? g_sh->api : L"(waiting for first frame)", g_sh->width, g_sh->height,
-            g_sh->isRecording ? L"RECORDING" : L"idle", (long long)g_sh->framesSaved, g_sh->takeDir, g_sh->status);
+            g_sh->isRecording ? L"RECORDING" : L"idle", g_sh->mode == FL_MODE_REALTIME ? L"real-time" : L"locked clock", (long long)g_sh->framesQueued, (long long)g_sh->framesSaved, (long long)g_sh->slipEvents, (unsigned)g_sh->lastHr, g_sh->takeDir, g_sh->status);
     }
     wchar_t old[2048]; GetWindowTextW(hStatus, old, 2048); if (wcscmp(old, txt)) SetWindowTextW(hStatus, txt);
     const wchar_t* lbl = (g_sh && (g_sh->wantRecord || g_sh->isRecording)) ? L"\u25A0  STOP  (F9)" : L"\u25CF  RECORD  (F9)";
@@ -211,8 +180,10 @@ static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         wchar_t def[MAX_PATH]; GetEnvironmentVariableW(L"USERPROFILE", def, MAX_PATH); wcscat_s(def, L"\\Videos\\FrameLock");
         hOut = Ctl(L"EDIT", def, ES_AUTOHSCROLL | WS_TABSTOP, 105, 111, 487, 24, IDC_OUT);
         Ctl(L"BUTTON", L"Browse...", WS_TABSTOP, 598, 111, 80, 24, IDC_BROWSE);
-        hRecord = Ctl(L"BUTTON", L"\u25CF  RECORD  (F9)", WS_TABSTOP, 105, 148, 573, 44, IDC_RECORD);
-        hStatus = Ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | WS_VSCROLL, 12, 204, 666, 110, IDC_STATUS);
+        hRecord = Ctl(L"BUTTON", L"\u25CF  RECORD  (F9)", WS_TABSTOP, 105, 148, 380, 44, IDC_RECORD);
+        Ctl(L"BUTTON", L"Self-test: 120 frames (F10)", WS_TABSTOP, 492, 148, 186, 44, IDC_TEST);
+        hRealtime = Ctl(L"BUTTON", L"Real-time capture (do not lock the game clock; saves only frames the game actually renders)", BS_AUTOCHECKBOX | WS_TABSTOP, 105, 198, 573, 20, IDC_REALTIME);
+        hStatus = Ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | WS_VSCROLL, 12, 226, 666, 110, IDC_STATUS);
         RefreshProcs(); SetTimer(w, 1, 250, nullptr);
         return 0; }
     case WM_TIMER: UpdateStatus(); return 0;
@@ -222,6 +193,7 @@ static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         case IDC_ATTACH: { int i = (int)SendMessageW(hProc, CB_GETCURSEL, 0, 0); if (i < 0 || i >= (int)g_pids.size()) Msg(L"Select the game process first."); else Attach(g_pids[i]); break; }
         case IDC_LAUNCH: LaunchGame(); break;
         case IDC_RECORD: ToggleRecord(); break;
+        case IDC_TEST: StartTest(); break;
         case IDC_BROWSE: {
             BROWSEINFOW bi = {}; bi.hwndOwner = w; bi.lpszTitle = L"Output folder for frames"; bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
             if (PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi)) { wchar_t p[MAX_PATH]; if (SHGetPathFromIDListW(pidl, p)) SetWindowTextW(hOut, p); CoTaskMemFree(pidl); }
@@ -240,7 +212,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int show) {
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     RegisterClassExW(&wc);
     HWND w = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName, APP_TITLE, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 706, 366, nullptr, nullptr, hi, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 706, 390, nullptr, nullptr, hi, nullptr);
     ShowWindow(w, show);
     MSG msg; while (GetMessageW(&msg, nullptr, 0, 0)) { if (!IsDialogMessageW(w, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); } }
     return 0;

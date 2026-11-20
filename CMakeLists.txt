@@ -37,7 +37,7 @@ add_library(FrameLockHook SHARED src/hook/dllmain.cpp)
 set_target_properties(FrameLockHook PROPERTIES OUTPUT_NAME FrameLockHook${FL_SUFFIX})
 target_compile_definitions(FrameLockHook PRIVATE UNICODE _UNICODE)
 target_compile_options(FrameLockHook PRIVATE /O2 /utf-8 /W3)
-target_link_libraries(FrameLockHook PRIVATE minhook_static ole32 oleaut32 windowscodecs uuid dxguid d3d10 user32 gdi32 shell32)
+target_link_libraries(FrameLockHook PRIVATE minhook_static ole32 oleaut32 windowscodecs uuid dxguid user32 gdi32 shell32)
 
 # ---- launcher GUI
 add_executable(FrameLock WIN32 src/launcher/main.cpp)
