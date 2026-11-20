@@ -12,7 +12,6 @@
 #include <string>
 #include <vector>
 #include <map>
-#include <cstdlib>
 #include <cmath>
 #include <cwchar>
 #include "../shared.h"
@@ -100,6 +99,8 @@ static void Attach(DWORD pid) {
     std::wstring err;
     if (!Inject(pid, err)) { Msg(err.c_str()); return; }
     g_pid = pid;
+    // Match the default UI choice even when recording is started with the in-game F9 hotkey.
+    if (hRealtime) InterlockedExchange(&g_sh->mode, SendMessageW(hRealtime, BM_GETCHECK, 0, 0) == BST_CHECKED ? FL_MODE_REALTIME : FL_MODE_LOCKED);
 }
 static bool ApplySettings() {
     wchar_t fps[64]; GetWindowTextW(hFps, fps, 64);
@@ -175,14 +176,15 @@ static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         Ctl(L"BUTTON", L"Launch game .exe and attach...", WS_TABSTOP, 105, 42, 250, 24, IDC_LAUNCH);
         Ctl(L"STATIC", L"FPS:", 0, 12, 80, 90, 20, 0);
         hFps = Ctl(L"EDIT", L"24", ES_AUTOHSCROLL | WS_TABSTOP, 105, 77, 120, 24, IDC_FPS);
-        Ctl(L"STATIC", L"(24, 30, 60, 23.976, 60000/1001 ...)   JPEG quality: 100% (4:4:4), native resolution", 0, 235, 80, 450, 20, 0);
+        Ctl(L"STATIC", L"(24, 30, 60, 23.976, 60000/1001 ...)  Locked-clock FPS; real-time uses captured game timing", 0, 235, 80, 450, 20, 0);
         Ctl(L"STATIC", L"Output folder:", 0, 12, 114, 90, 20, 0);
         wchar_t def[MAX_PATH]; GetEnvironmentVariableW(L"USERPROFILE", def, MAX_PATH); wcscat_s(def, L"\\Videos\\FrameLock");
         hOut = Ctl(L"EDIT", def, ES_AUTOHSCROLL | WS_TABSTOP, 105, 111, 487, 24, IDC_OUT);
         Ctl(L"BUTTON", L"Browse...", WS_TABSTOP, 598, 111, 80, 24, IDC_BROWSE);
         hRecord = Ctl(L"BUTTON", L"\u25CF  RECORD  (F9)", WS_TABSTOP, 105, 148, 380, 44, IDC_RECORD);
         Ctl(L"BUTTON", L"Self-test: 120 frames (F10)", WS_TABSTOP, 492, 148, 186, 44, IDC_TEST);
-        hRealtime = Ctl(L"BUTTON", L"Real-time capture (do not lock the game clock; saves only frames the game actually renders)", BS_AUTOCHECKBOX | WS_TABSTOP, 105, 198, 573, 20, IDC_REALTIME);
+        hRealtime = Ctl(L"BUTTON", L"Preserve actual game speed (real-time; save actual frame timings)", BS_AUTOCHECKBOX | WS_TABSTOP, 105, 198, 573, 20, IDC_REALTIME);
+        SendMessageW(hRealtime, BM_SETCHECK, BST_CHECKED, 0);
         hStatus = Ctl(L"EDIT", L"", ES_MULTILINE | ES_READONLY | WS_VSCROLL, 12, 226, 666, 110, IDC_STATUS);
         RefreshProcs(); SetTimer(w, 1, 250, nullptr);
         return 0; }
@@ -194,6 +196,9 @@ static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         case IDC_LAUNCH: LaunchGame(); break;
         case IDC_RECORD: ToggleRecord(); break;
         case IDC_TEST: StartTest(); break;
+        case IDC_REALTIME:
+            if (g_sh) InterlockedExchange(&g_sh->mode, SendMessageW(hRealtime, BM_GETCHECK, 0, 0) == BST_CHECKED ? FL_MODE_REALTIME : FL_MODE_LOCKED);
+            break;
         case IDC_BROWSE: {
             BROWSEINFOW bi = {}; bi.hwndOwner = w; bi.lpszTitle = L"Output folder for frames"; bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
             if (PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi)) { wchar_t p[MAX_PATH]; if (SHGetPathFromIDListW(pidl, p)) SetWindowTextW(hOut, p); CoTaskMemFree(pidl); }

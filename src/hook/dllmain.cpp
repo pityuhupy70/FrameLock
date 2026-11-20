@@ -25,9 +25,12 @@
 #include <deque>
 #include <vector>
 #include <string>
+#include <unordered_set>
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <cstdio>
-#include <cstring>
 #include <cstdint>
 #include <cstdarg>
 #include <cmath>
@@ -82,6 +85,7 @@ static uint64_t g_tick0 = 0;    // GetTickCount64 at init
 static uint32_t g_tgt0 = 0;     // timeGetTime at init
 static int64_t  g_ft0 = 0;      // system FILETIME at init
 static int64_t  g_fpsNum = 24, g_fpsDen = 1;
+static int64_t  g_frameTimeBase = 0;       // virtual QPC at take start
 
 static int64_t MulDiv64(int64_t a, int64_t b, int64_t c) { return (a / c) * b + ((a % c) * b) / c; }
 static int64_t RealQPC() {
@@ -97,11 +101,12 @@ static double RealMs(int64_t ticks) { return ticks * 1000.0 / (double)g_freq; }
 static int64_t FrameTicks(int64_t n) { return MulDiv64(n, g_freq * g_fpsDen, g_fpsNum); }
 
 // Locked-clock state for the current step n. Virtual time seen by the game during step n:
-//   base                      during a bounded initial dead zone (at most 10 ms)
+//   base                      for the first `dead` real ticks after Present returned (exact step start)
 //   base + (e - dead)         afterwards, advancing at real speed ...
 //   base + step - 1           ... capped just below the next step boundary (monotonic, no overlap)
-// If the game busy-waits on a hooked clock while it is held at the cap, the clock is released
-// after >0.5 s and >1000 clock queries. This releases that clock-busy-wait, and records a slip.
+// If the game busy-waits on the clock while it is held at the cap (frame limiter waiting longer
+// than one output step), the clock is released (free-run) after 0.5 s + 1000 queries so the game
+// can never hang; the step is then logged as a slip (that frame's dt was longer than 1/FPS).
 struct ClockState { int64_t base, step, anchor, dead; };
 static SRWLOCK              g_clk = SRWLOCK_INIT;
 static ClockState           g_cs = {};
@@ -147,7 +152,7 @@ static int64_t VirtDelta(int64_t unitsPerSec) {
 static void ClockStart() {
     AcquireSRWLockExclusive(&g_clk);
     int64_t real = RealQPC();
-    g_recBase = real + g_offset.load(); g_slip = 0; g_stepIdx = 0;
+    g_recBase = real + g_offset.load(); g_frameTimeBase = g_recBase; g_slip = 0; g_stepIdx = 0;
     g_cs.base = g_recBase; g_cs.step = FrameTicks(1); g_cs.anchor = real; g_cs.dead = DeadZone(g_cs.step);
     g_freeRun = false; g_holdQ = 0;
     g_lock.store(true, std::memory_order_release);
@@ -290,6 +295,7 @@ static int               g_fails = 0;
 static int64_t           g_nextIdx = 0;            // next frame index to capture (== frames queued)
 static int64_t           g_testTarget = 0;
 static int64_t           g_takeStartReal = 0;
+static int64_t           g_capturePtsTicks = 0;     // PTS sampled at the current Present
 static std::atomic<int>  g_takeId{ 0 };
 static std::atomic<int>  g_failedTake{ -1 };       // take that hit an async (post-queue) failure
 static std::atomic<bool> g_asyncFail{ false };
@@ -314,7 +320,9 @@ struct Job {
     int w = 0, h = 0; PF pf = PF::BGR24; size_t pitch = 0; std::vector<uint8_t> raw;     // CPU pixels
     D12Slot* slot = nullptr; ID3D12Fence* fence = nullptr; ID3D12Device* dev = nullptr;  // D3D12 readback
     UINT64 fenceVal = 0, offset = 0, size = 0;
+    int64_t ptsTicks = 0;
     bool end = false; int64_t endCount = 0; int64_t testTarget = 0; bool realtime = false; double wallSec = 0;
+    int64_t endPtsTicks = 0, fpsNum = 24, fpsDen = 1;
 };
 static const size_t kMaxJobs = 4;     // bounded queue: producer waits (backpressure), never drops
 static std::mutex g_jMx; static std::condition_variable g_jCv; static std::deque<Job> g_jobs;
@@ -331,52 +339,6 @@ static void Enqueue(Job&& j) {
     l.unlock(); g_jCv.notify_all();
 }
 static void ReleaseSlot(D12Slot* s) { { std::lock_guard<std::mutex> l(g_slotMx); s->busy = false; } g_slotCv.notify_all(); }
-
-// A slot may only be reused after its GPU copy fence is confirmed complete. This is
-// also used when a take has already failed and queued frames are being discarded.
-static bool WaitD12JobFence(const Job& j, HANDLE ev, HRESULT& e, const wchar_t*& stage) {
-    stage = L"D3D12 copy fence wait";
-    if (!j.fence) { e = E_POINTER; stage = L"D3D12 missing copy fence"; return false; }
-    UINT64 completed = j.fence->GetCompletedValue();
-    if (completed == UINT64_MAX) {
-        e = j.dev ? j.dev->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
-        if (SUCCEEDED(e)) e = DXGI_ERROR_DEVICE_REMOVED;
-        stage = L"D3D12 fence reports device removed";
-        return false;
-    }
-    if (completed < j.fenceVal) {
-        if (!ev) { e = E_HANDLE; stage = L"D3D12 fence event creation"; return false; }
-        e = j.fence->SetEventOnCompletion(j.fenceVal, ev);
-        if (FAILED(e)) { stage = L"D3D12 SetEventOnCompletion"; return false; }
-        DWORD wr = WaitForSingleObject(ev, 10000);
-        if (wr != WAIT_OBJECT_0) {
-            HRESULT removed = j.dev ? j.dev->GetDeviceRemovedReason() : S_OK;
-            if (FAILED(removed)) e = removed;
-            else if (wr == WAIT_TIMEOUT) e = HRESULT_FROM_WIN32(WAIT_TIMEOUT);
-            else { DWORD le = GetLastError(); e = HRESULT_FROM_WIN32(le ? le : ERROR_GEN_FAILURE); }
-            Log(L"[D3D12] fence wait failed (wait=%lu): completed=%llu wanted=%llu hr=0x%08X",
-                (unsigned long)wr, j.fence->GetCompletedValue(), j.fenceVal, (unsigned)e);
-            stage = L"D3D12 fence wait failed";
-            return false;
-        }
-        completed = j.fence->GetCompletedValue();
-        if (completed == UINT64_MAX || completed < j.fenceVal) {
-            e = j.dev ? j.dev->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
-            if (SUCCEEDED(e)) e = DXGI_ERROR_DEVICE_REMOVED;
-            stage = L"D3D12 fence did not confirm completion";
-            return false;
-        }
-    }
-    e = S_OK;
-    return true;
-}
-
-// If a fence cannot be confirmed, intentionally abandon the COM references. Releasing
-// or reusing these resources could race a GPU command that is still in flight.
-static void RetireD12Slot(D12Slot* s) {
-    std::lock_guard<std::mutex> l(g_slotMx);
-    s->rb = nullptr; s->al = nullptr; s->cl = nullptr; s->size = 0;
-}
 
 static bool EncodeJpeg(IWICImagingFactory* fac, const wchar_t* path, int w, int h, const uint8_t* data, bool v, HRESULT& hr, const wchar_t*& stage) {
     std::wstring tmp = std::wstring(path) + L".tmp";
@@ -416,8 +378,8 @@ static uint64_t Fnv1a(const uint8_t* p, size_t n) { uint64_t x = 146959810393466
 
 // Self-test verification: file count, sequential names, sizes, decodability, repeated hashes.
 static void VerifyTake(IWICImagingFactory* fac, const std::wstring& dir, int64_t expect) {
-    int64_t missing = 0, empty = 0, undecodable = 0, adjRepeat = 0, files = 0, tmpLeft = 0;
-    uint64_t prev = 0; std::vector<uint8_t> buf;
+    int64_t missing = 0, empty = 0, undecodable = 0, adjRepeat = 0, dupAny = 0, files = 0, tmpLeft = 0;
+    std::unordered_set<uint64_t> seen; uint64_t prev = 0; std::vector<uint8_t> buf;
     for (int64_t i = 0; i < expect; i++) {
         wchar_t p[MAX_PATH + 32]; swprintf_s(p, L"%s\\frame_%06lld.jpg", dir.c_str(), (long long)i);
         WIN32_FILE_ATTRIBUTE_DATA fa;
@@ -435,6 +397,7 @@ static void VerifyTake(IWICImagingFactory* fac, const std::wstring& dir, int64_t
         if (FAILED(hr)) { undecodable++; Log(L"TEST: cannot decode %s hr=0x%08X", p, (unsigned)hr); continue; }
         uint64_t hs = Fnv1a(buf.data(), buf.size());
         if (i > 0 && hs == prev) { adjRepeat++; Log(L"TEST: frame_%06lld identical to previous frame", (long long)i); }
+        if (!seen.insert(hs).second) dupAny++;
         prev = hs;
     }
     WIN32_FIND_DATAW fd; HANDLE fh = FindFirstFileW((dir + L"\\frame_*.jpg").c_str(), &fd);
@@ -442,16 +405,98 @@ static void VerifyTake(IWICImagingFactory* fac, const std::wstring& dir, int64_t
     fh = FindFirstFileW((dir + L"\\*.tmp").c_str(), &fd);
     if (fh != INVALID_HANDLE_VALUE) { do tmpLeft++; while (FindNextFileW(fh, &fd)); FindClose(fh); }
     bool filesOk = missing == 0 && empty == 0 && undecodable == 0 && files == expect && tmpLeft == 0;
-    bool pass = filesOk && adjRepeat == 0;
+    bool pass = filesOk && adjRepeat == 0 && dupAny == 0;
     wchar_t m[512];
     swprintf_s(m, L"TEST %s: %lld/%lld files (frame_000000..frame_%06lld), missing %lld, zero-size %lld, undecodable %lld, leftover .tmp %lld, "
-        L"repeated adjacent hashes %lld%s",
+        L"repeated adjacent hashes %lld, duplicate hashes %lld%s",
         pass ? L"PASS" : L"FAIL", (long long)files, (long long)expect, (long long)expect - 1, (long long)missing, (long long)empty,
-        (long long)undecodable, (long long)tmpLeft, (long long)adjRepeat,
+        (long long)undecodable, (long long)tmpLeft, (long long)adjRepeat, (long long)dupAny,
         (filesOk && !pass) ? L" (files OK; repeats mean a static/paused scene or a frame that did not change)" : L"");
     SetStatus(m);
     FILE* f = nullptr;
     if (_wfopen_s(&f, (dir + L"\\test_report.txt").c_str(), L"w, ccs=UTF-8") == 0 && f) { fwprintf(f, L"%s\n", m); fclose(f); }
+}
+
+struct TimingPoint { int64_t idx; int64_t ptsTicks; };
+
+// Writes an exact per-frame presentation timeline. JPEG sequences have no intrinsic FPS;
+// this sidecar prevents variable-rate game footage from being played back at an assumed CFR.
+static bool WriteTimingFiles(const std::wstring& dir, const std::vector<TimingPoint>& points,
+                             int64_t endPtsTicks, int64_t fpsNum, int64_t fpsDen, bool realtime) {
+    if (points.empty()) {
+        Log(L"TIMING: no successfully encoded frames; timing sidecars were not written");
+        return false;
+    }
+    std::vector<int64_t> pts(points.size()), durations(points.size());
+    const int64_t first = points.front().ptsTicks;
+    for (size_t i = 0; i < points.size(); ++i) {
+        int64_t p = points[i].ptsTicks - first;
+        if (p < 0) p = 0;
+        if (i && p <= pts[i - 1]) p = pts[i - 1] + 1; // enforce strictly increasing PTS in the manifest
+        pts[i] = p;
+    }
+    for (size_t i = 0; i + 1 < points.size(); ++i)
+        durations[i] = std::max<int64_t>(1, pts[i + 1] - pts[i]);
+    int64_t finalDuration = endPtsTicks - points.back().ptsTicks;
+    if (finalDuration <= 0 && points.size() > 1)
+        finalDuration = points.back().ptsTicks - points[points.size() - 2].ptsTicks;
+    if (finalDuration <= 0 && fpsNum > 0 && fpsDen > 0)
+        finalDuration = std::max<int64_t>(1, MulDiv64(g_freq, fpsDen, fpsNum));
+    durations.back() = std::max<int64_t>(1, finalDuration);
+
+    try {
+        const std::filesystem::path base(dir);
+        const std::filesystem::path csvPath = base / L"frame_timestamps.csv";
+        const std::filesystem::path csvTmp = base / L"frame_timestamps.csv.tmp";
+        std::ofstream csv(csvTmp, std::ios::binary | std::ios::trunc);
+        if (!csv) { Log(L"TIMING: cannot create frame_timestamps.csv.tmp"); return false; }
+        csv << "frame_index,pts_seconds,duration_seconds\n";
+        csv << std::fixed << std::setprecision(9);
+        for (size_t i = 0; i < points.size(); ++i) {
+            csv << points[i].idx << ','
+                << (long double)pts[i] / (long double)g_freq << ','
+                << (long double)durations[i] / (long double)g_freq << '\n';
+        }
+        csv.close();
+        if (!csv) { Log(L"TIMING: writing CSV failed"); return false; }
+        if (!MoveFileExW(csvTmp.c_str(), csvPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            Log(L"TIMING: committing CSV failed Win32 error %lu", GetLastError()); return false;
+        }
+
+        // FFmpeg concat-demuxer input with per-frame durations; unlike -framerate N,
+        // this preserves the captured game-time cadence, including slow frames/slips.
+        const std::filesystem::path ffPath = base / L"frames.ffconcat";
+        const std::filesystem::path ffTmp = base / L"frames.ffconcat.tmp";
+        std::ofstream ff(ffTmp, std::ios::binary | std::ios::trunc);
+        if (!ff) { Log(L"TIMING: cannot create frames.ffconcat.tmp"); return false; }
+        ff << "ffconcat version 1.0\n";
+        ff << std::fixed << std::setprecision(9);
+        for (size_t i = 0; i < points.size(); ++i) {
+            wchar_t name[64]; swprintf_s(name, L"frame_%06lld.jpg", (long long)points[i].idx);
+            char asciiName[64] = {};
+            WideCharToMultiByte(CP_UTF8, 0, name, -1, asciiName, (int)sizeof(asciiName), nullptr, nullptr);
+            ff << "file '" << asciiName << "'\n";
+            ff << "option framerate 1000000\n";
+            ff << "duration " << (long double)durations[i] / (long double)g_freq << "\n";
+        }
+        // Repeating the last still lets the concat demuxer honor the final duration.
+        wchar_t lastName[64]; swprintf_s(lastName, L"frame_%06lld.jpg", (long long)points.back().idx);
+        char asciiLast[64] = {};
+        WideCharToMultiByte(CP_UTF8, 0, lastName, -1, asciiLast, (int)sizeof(asciiLast), nullptr, nullptr);
+        ff << "file '" << asciiLast << "'\n";
+        ff << "option framerate 1000000\n";
+        ff.close();
+        if (!ff) { Log(L"TIMING: writing FFconcat file failed"); return false; }
+        if (!MoveFileExW(ffTmp.c_str(), ffPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            Log(L"TIMING: committing FFconcat file failed Win32 error %lu", GetLastError()); return false;
+        }
+        Log(L"TIMING: wrote %llu frame timestamps (%s) -> %s\\frame_timestamps.csv and frames.ffconcat",
+            (unsigned long long)points.size(), realtime ? L"real-time game clock" : L"locked simulation clock", dir.c_str());
+        return true;
+    } catch (...) {
+        Log(L"TIMING: exception while writing timing sidecars");
+        return false;
+    }
 }
 
 static DWORD WINAPI WorkerThread(LPVOID) {
@@ -460,53 +505,53 @@ static DWORD WINAPI WorkerThread(LPVOID) {
     HRESULT hf = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac));
     Log(L"Encoder thread: CoInitializeEx hr=0x%08X, WIC factory hr=0x%08X", (unsigned)hc, (unsigned)hf);
     HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!ev) Log(L"Encoder thread: CreateEventW failed (error %lu); D3D12 slots will be retired if a fence wait is needed", GetLastError());
     std::vector<uint8_t> bgr;
+    std::vector<TimingPoint> takeTiming; int timingTakeId = -1;
     for (;;) {
         Job j;
         { std::unique_lock<std::mutex> l(g_jMx); g_jCv.wait(l, [] { return !g_jobs.empty(); }); j = std::move(g_jobs.front()); g_jobs.pop_front(); }
         g_jCv.notify_all();
         if (j.end) {
+            if (timingTakeId == j.takeId) WriteTimingFiles(j.dir, takeTiming, j.endPtsTicks, j.fpsNum, j.fpsDen, j.realtime);
+            else Log(L"TIMING: no worker timing records found for take %d", j.takeId);
             if (g_failedTake != j.takeId) {
                 wchar_t m[700];
-                if (j.realtime) swprintf_s(m, L"Finished (real-time): %lld frames actually presented by the game in %.2f s (%.2f fps measured) -> %s",
+                if (j.realtime) swprintf_s(m, L"Finished (real-time): %lld game frames in %.2f s (%.2f fps measured); see frames.ffconcat for correct speed -> %s",
                     (long long)j.endCount, j.wallSec, j.wallSec > 0 ? j.endCount / j.wallSec : 0.0, j.dir.c_str());
-                else swprintf_s(m, L"Finished (locked clock): %lld frames = %lld simulation steps at %lld/%lld fps, %lld clock slips -> %s",
-                    (long long)j.endCount, (long long)j.endCount, (long long)g_fpsNum, (long long)g_fpsDen, g_sh ? (long long)g_sh->slipEvents : 0LL, j.dir.c_str());
+                else swprintf_s(m, L"Finished (locked clock): %lld frames = %lld simulation steps at %lld/%lld fps, %lld clock slips; timing saved -> %s",
+                    (long long)j.endCount, (long long)j.endCount, (long long)j.fpsNum, (long long)j.fpsDen, g_sh ? (long long)g_sh->slipEvents : 0LL, j.dir.c_str());
                 SetStatus(m);
             }
             if (j.testTarget > 0) VerifyTake(fac, j.dir, j.testTarget);
+            takeTiming.clear(); timingTakeId = -1;
             continue;
         }
-        if (j.takeId == g_failedTake) {
-            if (j.slot) {
-                HRESULT discardHr = S_OK; const wchar_t* discardStage = L"D3D12 discard fence wait";
-                if (!WaitD12JobFence(j, ev, discardHr, discardStage)) {
-                    Log(L"[D3D12] discarding frame %lld after prior failure; slot retired at '%s' hr=0x%08X",
-                        (long long)j.idx, discardStage, (unsigned)discardHr);
-                    RetireD12Slot(j.slot);
-                }
-                ReleaseSlot(j.slot);
-            }
-            continue; // keep output contiguous after a failure
-        }
+        if (timingTakeId != j.takeId) { takeTiming.clear(); timingTakeId = j.takeId; }
+        if (j.takeId == g_failedTake) { if (j.slot) ReleaseSlot(j.slot); continue; }   // keep output contiguous after a failure
         wchar_t path[MAX_PATH + 32]; swprintf_s(path, L"%s\\frame_%06lld.jpg", j.dir.c_str(), (long long)j.idx);
         bool v = j.idx < 2;
         const wchar_t* stage = L"WIC factory"; HRESULT e = hf; bool ok = false; bool slotUnsafe = false;
         do {
+            if (!fac) break;
             const uint8_t* src = j.raw.data(); size_t pitch = j.pitch; void* mapped = nullptr;
             if (j.slot) {
-                if (!WaitD12JobFence(j, ev, e, stage)) { slotUnsafe = true; break; }
+                stage = L"D3D12 copy fence wait"; e = S_OK;
+                if (j.fence->GetCompletedValue() < j.fenceVal) {
+                    e = j.fence->SetEventOnCompletion(j.fenceVal, ev);
+                    if (FAILED(e)) { stage = L"D3D12 SetEventOnCompletion"; break; }
+                    if (WaitForSingleObject(ev, 10000) != WAIT_OBJECT_0) {
+                        e = j.dev ? j.dev->GetDeviceRemovedReason() : E_FAIL; if (SUCCEEDED(e)) e = HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+                        Log(L"[D3D12] fence timeout: completed=%llu wanted=%llu", j.fence->GetCompletedValue(), j.fenceVal);
+                        slotUnsafe = true; break;
+                    }
+                }
                 if (v) Log(L"[D3D12] frame %lld: copy fence %llu completed", (long long)j.idx, j.fenceVal);
-                // Even if WIC failed to initialize, wait for the GPU before releasing this slot.
-                if (!fac) { stage = L"WIC factory"; e = hf; break; }
                 stage = L"D3D12 readback Map";
-                D3D12_RANGE r = { (SIZE_T)j.offset, (SIZE_T)(j.offset + j.size) };
-                e = j.slot->rb->Map(0, &r, &mapped); if (FAILED(e)) { slotUnsafe = true; break; }
+                D3D12_RANGE r = { (SIZE_T)j.offset, (SIZE_T)j.size };
+                e = j.slot->rb->Map(0, &r, &mapped); if (FAILED(e)) break;
                 src = (const uint8_t*)mapped + j.offset;
                 if (v) Log(L"[D3D12] frame %lld: Map OK (rowPitch %zu, %llu bytes)", (long long)j.idx, pitch, j.size);
             }
-            if (!fac) break;
             stage = L"pixel conversion";
             bgr.resize((size_t)j.w * j.h * 3);
             Convert(j.pf, src, pitch, j.w, j.h, bgr.data());
@@ -516,10 +561,11 @@ static DWORD WINAPI WorkerThread(LPVOID) {
             ok = EncodeJpeg(fac, path, j.w, j.h, bgr.data(), v, e, stage);
         } while (0);
         if (j.slot) {
-            if (slotUnsafe) RetireD12Slot(j.slot); // GPU may still use them: leak, never reuse
+            if (slotUnsafe) { std::lock_guard<std::mutex> l(g_slotMx); j.slot->rb = nullptr; j.slot->al = nullptr; j.slot->cl = nullptr; j.slot->size = 0; } // GPU may still use them: leak, never reuse
             ReleaseSlot(j.slot);
         }
         if (ok) {
+            takeTiming.push_back({ j.idx, j.ptsTicks });
             if (g_sh) { InterlockedExchange64(&g_sh->framesSaved, j.idx + 1); g_sh->width = j.w; g_sh->height = j.h; }
             if (v || j.idx % 100 == 0) Log(L"Saved %s", path);
         } else {
@@ -530,7 +576,7 @@ static DWORD WINAPI WorkerThread(LPVOID) {
 }
 
 // ============================================================ Direct3D 11 capture (staging ring, non-blocking Map)
-struct D11Ent { ID3D11Texture2D* tex = nullptr; int64_t idx = 0; int takeId = 0; std::wstring dir; };
+struct D11Ent { ID3D11Texture2D* tex = nullptr; int64_t idx = 0; int takeId = 0; int64_t ptsTicks = 0; std::wstring dir; };
 static struct { ID3D11Device* dev = nullptr; ID3D11DeviceContext* ctx = nullptr; D11Ent e[3]; int head = 0, count = 0;
                 D3D11_TEXTURE2D_DESC desc = {}; ID3D11Texture2D* resolved = nullptr; PF pf = PF::BGRA8; } g11;
 
@@ -547,7 +593,7 @@ static int D11CollectOne(bool block) {
         if (g_failedTake != e.takeId) ReportAsyncFailure(e.takeId, e.idx, L"D3D11 staging Map", hr);
         return -1;
     }
-    Job j; j.takeId = e.takeId; j.idx = e.idx; j.dir = e.dir; j.w = (int)g11.desc.Width; j.h = (int)g11.desc.Height; j.pf = g11.pf;
+    Job j; j.takeId = e.takeId; j.idx = e.idx; j.ptsTicks = e.ptsTicks; j.dir = e.dir; j.w = (int)g11.desc.Width; j.h = (int)g11.desc.Height; j.pf = g11.pf;
     j.pitch = (size_t)j.w * BppOf(j.pf); j.raw.resize(j.pitch * j.h);
     for (int y = 0; y < j.h; y++) memcpy(j.raw.data() + (size_t)y * j.pitch, (const uint8_t*)m.pData + (size_t)y * m.RowPitch, j.pitch);
     g11.ctx->Unmap(e.tex, 0);
@@ -606,7 +652,7 @@ static bool SubmitD3D11(IDXGISwapChain* sc, ID3D11Device* dev, int64_t idx, bool
             g11.ctx->ResolveSubresource(g11.resolved, 0, bb, 0, copyFmt); src = g11.resolved;
         }
         g11.ctx->CopyResource(e.tex, src);
-        e.idx = idx; e.takeId = g_takeId; e.dir = g_takeDir; g11.count++;
+        e.idx = idx; e.takeId = g_takeId; e.ptsTicks = g_capturePtsTicks; e.dir = g_takeDir; g11.count++;
         if (v) Log(L"[D3D11] frame %lld: CopyResource -> staging slot %d submitted", (long long)idx, slot);
         ok = true;
     } while (0);
@@ -708,7 +754,7 @@ static bool SubmitD3D12(IDXGISwapChain* sc, int64_t idx, bool v, const wchar_t*&
         if (v) Log(L"[D3D12] frame %lld: barrier PRESENT->COPY_SOURCE->PRESENT, CopyTextureRegion %ux%u rowPitch %u -> slot %d submitted, fence value %llu",
             (long long)idx, fp.Footprint.Width, fp.Footprint.Height, fp.Footprint.RowPitch, g12.next, val);
         Job j; j.takeId = g_takeId; j.idx = idx; j.dir = g_takeDir; j.w = (int)rd.Width; j.h = (int)rd.Height; j.pf = pf;
-        j.pitch = fp.Footprint.RowPitch; j.slot = s; j.fence = g12.fence; j.dev = g12.dev; j.fenceVal = val; j.offset = fp.Offset; j.size = total;
+        j.pitch = fp.Footprint.RowPitch; j.slot = s; j.fence = g12.fence; j.dev = g12.dev; j.fenceVal = val; j.offset = fp.Offset; j.size = total; j.ptsTicks = g_capturePtsTicks;
         g12.next = (g12.next + 1) % 3;
         Enqueue(std::move(j));
         ok = true;
@@ -729,7 +775,7 @@ static bool SubmitDXGI(IDXGISwapChain* sc, int64_t idx, bool v, const wchar_t*& 
 // D3D9 / OpenGL: synchronous GPU readback (unchanged), encoding moved to the worker.
 static bool QueueCpuFrame(Frame& f, int64_t idx) {
     if (f.w <= 0 || f.h <= 0) return false;
-    Job j; j.takeId = g_takeId; j.idx = idx; j.dir = g_takeDir; j.w = f.w; j.h = f.h; j.pf = PF::BGR24; j.pitch = (size_t)f.w * 3; j.raw = std::move(f.bgr);
+    Job j; j.takeId = g_takeId; j.idx = idx; j.ptsTicks = g_capturePtsTicks; j.dir = g_takeDir; j.w = f.w; j.h = f.h; j.pf = PF::BGR24; j.pitch = (size_t)f.w * 3; j.raw = std::move(f.bgr);
     Enqueue(std::move(j));
     return true;
 }
@@ -851,6 +897,8 @@ static bool StartTake(void* obj) {
     InterlockedExchange64(&g_sh->slipEvents, 0); InterlockedExchange(&g_sh->lastHr, 0);
     g_takeId++; g_asyncFail = false; g_nextIdx = 0; g_fails = 0; g_target = obj; g_api = Api::None;
     g_takeStartReal = RealQPC();
+    g_frameTimeBase = g_takeStartReal + g_offset.load(std::memory_order_relaxed);
+    g_capturePtsTicks = 0;
     g_rec = true; InterlockedExchange(&g_sh->isRecording, 1);
     wchar_t m[700];
     swprintf_s(m, L"TAKE START: mode=%s, fps=%ld/%ld, test=%lld frames, target=%p -> %s",
@@ -859,13 +907,19 @@ static bool StartTake(void* obj) {
     return true;
 }
 static void StopTake(const wchar_t* why) {
+    // Snapshot the final presentation time before draining readbacks or unlocking the clock.
+    int64_t endPtsTicks = VirtQPC() - g_frameTimeBase;
+    if (endPtsTicks < 0) endPtsTicks = 0;
+    int64_t wallEnd = RealQPC();
     if (g_api == Api::D11 && !D11Drain()) D11ReleaseRing();   // queue remaining in-flight D3D11 copies
     ClockStop();
-    double wall = (RealQPC() - g_takeStartReal) / (double)g_freq;
+    double wall = (wallEnd - g_takeStartReal) / (double)g_freq;
     g_rec = false; g_target = nullptr;
     InterlockedExchange(&g_sh->isRecording, 0); InterlockedExchange(&g_sh->wantRecord, 0);
     Log(L"TAKE STOP (%s): %lld frames queued, waiting for encoder", why, (long long)g_nextIdx);
     Job e; e.end = true; e.takeId = g_takeId; e.dir = g_takeDir; e.endCount = g_nextIdx; e.testTarget = g_testTarget; e.realtime = !g_lockMode; e.wallSec = wall;
+    e.endPtsTicks = endPtsTicks;
+    e.fpsNum = g_fpsNum; e.fpsDen = g_fpsDen;
     Enqueue(std::move(e));
 }
 
@@ -881,6 +935,8 @@ template <class Cap> static int FrameStepPre(void* obj, Cap& cap) {
     if (g_asyncFail) { StopTake(L"async failure"); return 0; }
     if (!want) { StopTake(L"user"); return 0; }
     int64_t n = g_nextIdx;
+    g_capturePtsTicks = VirtQPC() - g_frameTimeBase;
+    if (g_capturePtsTicks < 0) g_capturePtsTicks = 0;
     const wchar_t* stage = L"capture"; HRESULT hr = E_FAIL;
     if (!cap(n, n < 2, stage, hr)) {                    // nothing queued: index and clock NOT advanced
         InterlockedExchange(&g_sh->lastHr, (LONG)hr);
@@ -923,7 +979,7 @@ typedef BOOL(WINAPI* SwapLayer_t)(HDC, UINT);
 
 static Present_t o_Present = nullptr; static Present1_t o_Present1 = nullptr; static ECL_t o_ECL = nullptr;
 static D9Present_t o_D9Present = nullptr, o_D9Present2 = nullptr; static D9PresentEx_t o_D9PresentEx = nullptr; static D9SwPresent_t o_D9SwPresent = nullptr;
-static Swap_t o_gdiSwap = nullptr; static SwapLayer_t o_wglSwapLayer = nullptr;
+static Swap_t o_wglSwap = nullptr, o_gdiSwap = nullptr; static SwapLayer_t o_wglSwapLayer = nullptr;
 
 #define CPU_CAP(expr, api) [&](int64_t idx, bool, const wchar_t*& stage, HRESULT& hr) { g_api = api; Frame f; stage = L"synchronous readback"; hr = E_FAIL; if (!(expr)) return false; hr = S_OK; return QueueCpuFrame(f, idx); }
 
@@ -955,6 +1011,9 @@ static HRESULT STDMETHODCALLTYPE Hk_D9PresentEx(IDirect3DDevice9Ex* d, const REC
 static HRESULT STDMETHODCALLTYPE Hk_D9SwPresent(IDirect3DSwapChain9* sw, const RECT* s, const RECT* r, HWND w, const RGNDATA* rg, DWORD fl) {
     IDirect3DDevice9* dev = nullptr; sw->GetDevice(&dev); if (dev) dev->Release();   // device pointer used as target id
     return PresentWrap(dev ? (void*)dev : (void*)sw, CPU_CAP(CaptureD9Swap(sw, f), Api::D9), [&] { return o_D9SwPresent(sw, s, r, w, rg, fl); });
+}
+static BOOL WINAPI Hk_wglSwap(HDC hdc) {
+    return PresentWrap(WindowFromDC(hdc), CPU_CAP(CaptureGL(hdc, f), Api::GL), [&] { return o_wglSwap(hdc); });
 }
 static BOOL WINAPI Hk_gdiSwap(HDC hdc) {
     return PresentWrap(WindowFromDC(hdc), CPU_CAP(CaptureGL(hdc, f), Api::GL), [&] { return o_gdiSwap(hdc); });
@@ -1043,10 +1102,10 @@ static bool HookD3D9() {
     return ok;
 }
 static bool HookGL() {
-    // The Win32 SwapBuffers entry point is exported by GDI32 (not opengl32).
-    bool swap = Hook(Proc(L"gdi32.dll", "SwapBuffers"), (void*)Hk_gdiSwap, (void**)&o_gdiSwap, "gdi32!SwapBuffers");
-    bool layer = Hook(Proc(L"opengl32.dll", "wglSwapLayerBuffers"), (void*)Hk_wglSwapLayer, (void**)&o_wglSwapLayer, "wglSwapLayerBuffers");
-    return swap || layer;
+    bool ok = Hook(Proc(L"opengl32.dll", "wglSwapBuffers"), (void*)Hk_wglSwap, (void**)&o_wglSwap, "wglSwapBuffers");
+    Hook(Proc(L"opengl32.dll", "wglSwapLayerBuffers"), (void*)Hk_wglSwapLayer, (void**)&o_wglSwapLayer, "wglSwapLayerBuffers");
+    Hook(Proc(L"gdi32.dll", "SwapBuffers"), (void*)Hk_gdiSwap, (void**)&o_gdiSwap, "gdi32!SwapBuffers");
+    return ok;
 }
 
 // ============================================================ init
@@ -1066,9 +1125,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     OpenShared();
     if (!g_sh) { Log(L"Shared memory failed"); return 0; }
     InitLut();
-    HANDLE worker = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
-    if (!worker) { SetStatus(L"ERROR: could not start the JPEG encoder thread"); return 0; }
-    CloseHandle(worker);
+    CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
     if (MH_Initialize() != MH_OK) { SetStatus(L"ERROR: MinHook init failed"); return 0; }
     InstallTimeHooks();
     InterlockedExchange(&g_sh->hooksReady, 1);

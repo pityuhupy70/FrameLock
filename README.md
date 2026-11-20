@@ -1,63 +1,57 @@
-# FrameLock Recorder — experimental v2 source
+# FrameLock Recorder
 
-FrameLock is an experimental injected recorder that saves presented game frames as a numbered JPEG sequence. **This source package has not been built or tested against real games.** Do not treat compatibility or frame timing as confirmed until the D3D11 and D3D12 self-tests pass on your machine.
+A game frame-sequence recorder with two timing modes. The default **Preserve actual game speed** mode leaves the game clock untouched and records the real presentation time of every frame. Optional **Locked clock** mode advances the game simulation in rational 1/FPS steps for offline frame-by-frame export. Frames are saved as sequential JPEG files; timestamp sidecars preserve the actual timing when the game runs at a variable frame rate.
 
-## Recording modes
+## Build (one time)
+1. Install **Visual Studio 2022** (Community is fine) and choose the **Desktop development with C++** workload.
+2. Double-click `build.bat`. It needs internet once to download MinHook.
+3. The finished program is in `dist\`:
+   - `FrameLock64.exe` + `FrameLockHook64.dll` for 64-bit games (almost all modern games)
+   - `FrameLock32.exe` + `FrameLockHook32.dll` for old 32-bit games
 
-- **Locked-clock export (default):** the DLL virtualizes selected Windows time APIs used by the game. At the start of each step, the virtual clock is held briefly (at most 10 ms), then advances at real speed and is capped just below the step boundary. After a frame is queued, the next rational-FPS step begins. If a game busy-polls a hooked clock while held at the boundary, a watchdog releases that clock after more than 0.5 seconds and 1,000 queries, and records a slip. This watchdog specifically detects clock polling; it is not a universal detector for every sleep-based or engine-level frame limiter. A slip means that step took longer than the requested interval.
-- **Real-time capture:** the DLL leaves the hooked clocks alone and saves frames the game presents. It does not synthesize missing frames. The final status reports the measured presentation rate.
-
-Locked-clock mode is a clock-hooking approximation, not an engine-level simulation API. It cannot control games that base simulation on unhooked timers, CPU timestamp instructions, their own fixed-step accumulator, or external clocks. It therefore cannot guarantee identical simulation behavior in every title.
-
-## Capture and writing pipeline
-
-- **D3D11:** copies the presented back buffer to a three-slot staging ring. Completed copies are mapped without waiting where possible; the ring applies backpressure if all slots are busy.
-- **D3D12:** copies the current back buffer on the swapchain-associated direct queue, restores the resource to PRESENT, and uses per-slot allocators, command lists, readback buffers and a fence. The worker maps a slot only after fence completion is confirmed. MSAA back buffers are not supported.
-- **D3D9 and OpenGL:** readback remains synchronous; JPEG encoding and file writing are delegated to the worker.
-- **JPEG output:** WIC encodes frames on a worker thread. Files are written as `.tmp` and renamed to `.jpg` after commit. The capture queue is bounded; when it is full, the render thread waits rather than silently dropping a queued frame. GPU-slot backpressure can also make the render thread wait.
-
-The frame index advances after the capture has been accepted into the readback/worker queue, not after the JPEG has finished writing. The worker writes jobs in order. If an asynchronous job fails, the take is stopped and later queued jobs from that take are discarded so that already-written files remain contiguous.
-
-## Build locally
-
-Requirements: Windows, Visual Studio 2022 with **Desktop development with C++**, CMake, and internet access during configuration so CMake can download MinHook.
-
-Run `build.bat` from this folder. The output is placed in `dist\\`:
-
-- `FrameLock64.exe` + `FrameLockHook64.dll` for 64-bit games
-- `FrameLock32.exe` + `FrameLockHook32.dll` for 32-bit games
-
-Keep each executable beside its matching DLL.
-
-## Build with GitHub Actions (no local compiler required)
-
-1. Create or open a GitHub repository and upload the contents of this folder, preserving `.github/workflows/windows-build.yml` and `src/`.
-2. Open **Actions**, select **Build FrameLock for Windows**, and choose **Run workflow**.
-3. When the run completes, download the `FrameLock-Windows` artifact. It contains both launcher/DLL pairs.
-
-The GitHub runner performs the Windows builds and downloads MinHook. Your own computer does not need Visual Studio for this route, but the GitHub runner needs network access.
+Keep each `.exe` in the same folder as its `.dll`.
 
 ## Use
+1. Start the game, preferably in **borderless/windowed** or fullscreen mode. Load into the scene you want.
+2. Run `FrameLock64.exe`. Run it **as Administrator** if the game runs elevated.
+3. Select the game in the list and press **Attach**. You can also use *Launch game .exe and attach*.
+4. Set the **FPS** (e.g. `24`, `30`, `60`, `23.976`, `60000/1001`) for locked-clock mode, and choose the **output folder**. Real-time mode uses the game's actual timing.
+5. Press **RECORD**, or press **F9** inside the game. Press it again to stop.
+6. Each take goes into its own folder: `OutputFolder\Take_YYYYMMDD_HHMMSS\frame_000000.jpg, frame_000001.jpg, ...`, plus `frame_timestamps.csv` and `frames.ffconcat` timing files.
 
-1. Start the game and load a moving scene. Borderless/windowed mode is a useful starting point.
-2. Run the matching launcher. Run it elevated only when the game itself is elevated.
-3. Select the game process and press **Attach** (or launch the game's executable from the launcher).
-4. Set the FPS and output folder. Examples: `24`, `30`, `60`, `23.976`, `60000/1001`.
-5. Press **RECORD** or F9 to start/stop. Enable **Real-time capture** for the real-time mode.
-6. Each take is written under `OutputFolder\\Take_YYYYMMDD_HHMMSS\\` as `frame_000000.jpg`, `frame_000001.jpg`, and so on.
+**To preserve the game's actual playback speed**, leave **Preserve actual game speed** checked (real-time mode). FrameLock records only frames the game really presents and writes their actual time intervals. Do not import the JPGs as a fixed-rate sequence (for example, `-framerate 24`) because that can make a 60-FPS capture play 2.5x too fast. Use the generated FFmpeg concat list instead:
+`ffmpeg -safe 0 -f concat -i frames.ffconcat -fps_mode vfr -c:v libx264 -bf 0 -crf 12 -pix_fmt yuv420p out.mp4`
 
-## Diagnostics and self-test
+The FPS field controls locked-clock mode; in real-time mode the recorded timestamps determine playback cadence.
 
-The log is `%TEMP%\\FrameLock_<pid>.log`. Frames 0 and 1 log detailed capture steps. Capture and worker failures report the stage and HRESULT where the API supplies one. The D3D9/OpenGL helper path still reports generic synchronous-readback failures rather than every underlying API error.
+## How it works
+- **Timing:** in real-time mode, the clock is untouched and each captured frame gets a QPC presentation timestamp. In locked-clock mode, the DLL hooks `QueryPerformanceCounter` (ntdll/kernelbase/kernel32), `GetTickCount`, `GetTickCount64`, `timeGetTime`, `GetSystemTimeAsFileTime` and `GetSystemTimePreciseAsFileTime`; game time advances in rational 1/FPS simulation steps. Any clock slips are reflected in the per-frame timestamps.
+- **Capture:** the DLL hooks DXGI (`Present`/`Present1`, covering D3D11 and D3D12), Direct3D 9 and OpenGL presentation calls. D3D11/D3D12 use asynchronous readback paths; D3D12 waits for the copy fence before mapping the readback resource. D3D9/OpenGL readback remains synchronous. Captures use the game's render resolution.
+- **Saving:** frames are encoded as JPEG with WIC at **quality 1.0 with 4:4:4 chroma** on a worker thread. The capture pipeline preserves frame order and applies backpressure rather than intentionally dropping frames. `frame_timestamps.csv` stores PTS/duration per saved image and `frames.ffconcat` provides an FFmpeg variable-frame-rate input list.
+- If a capture fails, time is **not** advanced, so the same frame is retried. After 3 failures in a row, recording stops instead of skipping a frame.
 
-Press F10 or click **Self-test: 120 frames**. In a moving scene, it checks for 120 sequential filenames, non-empty files, WIC-decodable JPEGs, no identical adjacent frame hashes, and no leftover `.tmp` files. The result is shown in the status line and written to `test_report.txt` in the take folder. A static or paused scene will fail the repeated-frame check.
+## Limitations (things that cannot be fully controlled from outside)
+- **Anti-cheat games** (EasyAntiCheat, BattlEye, Vanguard, etc.) block injection. **Do not use this tool in online or multiplayer games, because your account can be banned.** Use it in offline or single-player modes only.
+- **Vulkan** games: the clock control works, but frame capture is not implemented in this version. Use the game's DX11/DX12 option if it has one.
+- **Direct3D 10-only** games are not captured.
+- Games that read the CPU timestamp directly (`rdtsc`) or tie physics, animation or video playback to real time in other ways may not stay perfectly in sync. Most engines use QPC, so they work.
+- **Frame limiters or busy-waiting on the clock:** turn off the in-game FPS cap and VSync for best results. If a game spins waiting for time to pass, a watchdog nudges the clock by 1 ms after 2 s; the UI shows this as "Watchdog slips". Zero slips means a perfect take.
+- Audio is not recorded, and game audio may sound wrong while recording.
+- 10-bit HDR10 (PQ) output is saved without tone mapping. Turn HDR off in the game for correct colors.
+- Log file: `%TEMP%\FrameLock_<pid>.log`.
 
-## Known limitations and unverified behavior
+## v2 fix notes (capture failure / clock deadlock)
 
-- D3D11 and D3D12 have **not** been validated against real games. Run the 120-frame self-test separately on at least one game using each API.
-- D3D12 MSAA back buffers and Vulkan capture are unsupported.
-- If the swapchain's D3D12 queue cannot be queried, the implementation falls back to the last DIRECT queue observed by the hook and logs a warning. That queue is not proven to be the swapchain's actual present queue; capture and resource synchronization are therefore not guaranteed in this fallback case.
-- D3D9 and OpenGL capture paths are synchronous and have not been tested.
-- Some games use time sources that are not hooked or manage their simulation timing independently. Locked-clock mode may produce uneven timing or slips in those games.
-- The render thread can wait under queue or GPU-slot backpressure. The encoder itself runs on a separate worker thread, but the entire capture path is not guaranteed to be non-blocking.
-- Audio is not captured. Anti-cheat-protected and online multiplayer games should not be used; DLL injection may violate their rules or trigger anti-cheat protections.
+**Root cause of the empty Take folder:** recording froze the virtual clock completely until the next Present, and the watchdog only released it after >200000 clock queries and >2 s. Games with a Sleep/QPC frame limiter never reached the next Present, so capture never ran. HRESULTs were not logged, so the log showed nothing.
+
+**Modes**
+- *Locked clock (optional offline export):* one simulation step per captured frame at the rational FPS. Time is never frozen: it runs at real speed inside the current step, capped at the end of the step, so frame limiters always reach Present. If the game cannot reach the next Present within the step (FPS cap below output FPS), the clock slips (logged and counted as "Clock slips") instead of hanging.
+- *Real-time capture (default checkbox):* the clock is not touched; only frames the game actually presents are saved. Exact presentation timestamps and durations are written to `frame_timestamps.csv` and `frames.ffconcat`, so variable game FPS is not forced into a fixed-rate sequence. Nothing is duplicated or fabricated.
+
+**Pipeline:** D3D11 = CopyResource into a 3-slot staging ring with non-blocking Map. D3D12 = current back buffer index, PRESENT->COPY_SOURCE->PRESENT barriers on the swapchain's queue, per-slot allocator/list/readback buffer, fence Signal; the encoder thread waits for the fence before Map. JPEG encoding runs on a worker thread with a 4-job bounded queue (backpressure, never drops). Frames are written as `.tmp` and then renamed. Per-frame timestamps are carried through asynchronous readback/encoding and written in frame order.
+
+**Logs:** `%TEMP%\FrameLock_<pid>.log`. Frames 0 and 1 log every stage (device, swapchain size/format, buffer index, state, copy submit, fence, Map, conversion, JPEG options, output path). Any failure logs `stage` + `HRESULT` and stops the take (the frames already saved stay contiguous).
+
+**Self-test:** press F10 or click *Self-test: 120 frames*. It captures 120 frames and then checks: 120 files, sequential names `frame_000000..frame_000119`, non-zero sizes, WIC-decodable, no identical adjacent frames or duplicate hashes, no leftover `.tmp`. The result is shown in the status line and saved to `test_report.txt` in the Take folder. Use a moving scene, because a static or paused scene fails the repeat check by design.
+
+**Not yet validated:** this version has not been compiled or run against real games. Test D3D11 and D3D12 games separately with the self-test before relying on it. D3D12 MSAA back buffers, Vulkan, and D3D12 games where the swapchain queue cannot be queried (fallback to the last DIRECT queue, logged as a WARNING) are unsupported or unverified. D3D9/OpenGL capture is still a synchronous readback (encoding is async) and has not been validated.
