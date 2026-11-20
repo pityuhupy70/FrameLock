@@ -2,7 +2,7 @@
 #pragma once
 #include <windows.h>
 
-#define FL_MAGIC 0x464C4B32u                      // bumped: layout changed (v2)
+#define FL_MAGIC 0x464C4B33u                      // bumped: v3 timing semantics (launcher and DLL must match)
 #define FL_SHARED_FMT L"Local\\FrameLock_%lu"   // %lu = target process id
 
 #define FL_MODE_LOCKED   0   // offline export: game clock stepped exactly 1/FPS per captured frame
@@ -19,7 +19,7 @@ struct FLShared {
     volatile LONG  width;           // last captured frame size
     volatile LONG  height;
     volatile LONG64 framesSaved;    // frames fully written (JPEG on disk) in current/last take
-    volatile LONG64 slipEvents;     // clock releases (game busy-waited beyond one step)
+    volatile LONG64 slipEvents;     // stall warnings (game waited > 3 s at a frame boundary; time is never slipped)
     wchar_t        outDir[MAX_PATH];
     wchar_t        takeDir[MAX_PATH];
     wchar_t        api[64];         // graphics API detected
